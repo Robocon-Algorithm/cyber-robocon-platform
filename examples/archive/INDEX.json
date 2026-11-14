@@ -1,0 +1,74 @@
+[
+  {
+    "file": "A__84e976b1__l1_reach_builder.py",
+    "team": "A",
+    "version": "b6d3d3b702a14a8c86e3e7aaf1a74c79",
+    "filename": "l1_reach_builder.py",
+    "sha256": "84e976b1a2ff65310cc8ecd3361d4398bb5b435e7a6de9f18b8b844c7656a46b",
+    "created": 1794619961.8693702,
+    "bytes": 4677
+  },
+  {
+    "file": "A__ce8b908b__adaptive_raider.py",
+    "team": "A",
+    "version": "c896b3fac4d847e7ae51f0b018dca77c",
+    "filename": "adaptive_raider.py",
+    "sha256": "ce8b908be8d984ecead5bd0767443fd0549a145dcd54e59efd7c4b465eb3bfbe",
+    "created": 1794620015.6275496,
+    "bytes": 8625
+  },
+  {
+    "file": "B__84e976b1__l1_reach_builder.py",
+    "team": "B",
+    "version": "c9cdfb0f10824544a051fea5a0bd8d31",
+    "filename": "l1_reach_builder.py",
+    "sha256": "84e976b1a2ff65310cc8ecd3361d4398bb5b435e7a6de9f18b8b844c7656a46b",
+    "created": 1794620209.9791853,
+    "bytes": 4677
+  },
+  {
+    "file": "C__365eb4e7__stack_builder.py",
+    "team": "C",
+    "version": "48e0c6c6ae4b46adb36411940d33298f",
+    "filename": "stack_builder.py",
+    "sha256": "365eb4e7c1700b1bb85a31ca768d1d73518ae834b231e9689a6e15531f86917e",
+    "created": 1794620308.343103,
+    "bytes": 6945
+  },
+  {
+    "file": "123__ce8b908b__adaptive_raider.py",
+    "team": "123",
+    "version": "7129248b69b541fa99623c4384420610",
+    "filename": "adaptive_raider.py",
+    "sha256": "ce8b908be8d984ecead5bd0767443fd0549a145dcd54e59efd7c4b465eb3bfbe",
+    "created": 1794633845.9448223,
+    "bytes": 8625
+  },
+  {
+    "file": "321__84e976b1__l1_reach_builder.py",
+    "team": "321",
+    "version": "7b527cc1cd494d68a306a6b41dae71e4",
+    "filename": "l1_reach_builder.py",
+    "sha256": "84e976b1a2ff65310cc8ecd3361d4398bb5b435e7a6de9f18b8b844c7656a46b",
+    "created": 1794633855.5720415,
+    "bytes": 4677
+  },
+  {
+    "file": "321__365eb4e7__stack_builder.py",
+    "team": "321",
+    "version": "10df7c88541e4c90847aa7f6f4a75ffa",
+    "filename": "stack_builder.py",
+    "sha256": "365eb4e7c1700b1bb85a31ca768d1d73518ae834b231e9689a6e15531f86917e",
+    "created": 1794634147.1766846,
+    "bytes": 6945
+  },
+  {
+    "file": "123__365eb4e7__stack_builder.py",
+    "team": "123",
+    "version": "a96cef1c4aa64715b291ce9bc2d7beda",
+    "filename": "stack_builder.py",
+    "sha256": "365eb4e7c1700b1bb85a31ca768d1d73518ae834b231e9689a6e15531f86917e",
+    "created": 1794634166.9613283,
+    "bytes": 6945
+  }
+]

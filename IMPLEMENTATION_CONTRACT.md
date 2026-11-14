@@ -14,10 +14,12 @@
 
 内核不依赖 SDK 类。快照是深拷贝；SDK 再递归转换为只读字段视图，使 `obs.self.pose.x_mm`、`obs.towers[id]`、`obs.stacks.get(id)` 可用。字典键访问与属性访问并存，嵌套列表不可修改。SDK 不接受修改本地视图来改服务器。
 
+`map` 与 `parameters` 在引擎内只读，发布时以**共享引用**进入快照，不逐帧深拷贝；其余字段仍每帧新建。任何就地修改 `world["map"]` / `world["parameters"]` 的行为都会在 `Engine.result()` 被断言拦下。
+
 机器人编号 `red_br`、`blue_br`，队伍键 `red`、`blue`。坐标单位 mm，角度 mrad，时钟整数 ms。首版字段如下：
 
 - 顶层：`seq, sim_time_ms, world_revision, remaining_ms, self, opponent, robots, towers, items, stacks, supply, qualified, central_ball, score, events, receipts, map, parameters`。
-- 机器人：`id, team, pose, motion_state, cargo, carried_stack_id, control_state, action`。`cargo` 是物品字典列表。`control_state` 为 `INIT / READY / PAUSED / RETRYING / FINISHED`。
+- 机器人：`id, team, pose, motion_state, cargo, carried_stack_id, control_state, action`。`cargo` 是物品字典列表。`control_state` 为 `INIT / READY / PAUSED / RETRYING / FINISHED`。`motion_state` 含速度与当前分段进度，**不重复携带分段表**；运动分段只在 `action.segments` 上发布，取用方（如 `braking_preview`）以它为准。
 - 姿态：`x_mm, y_mm, z_mm, heading_mrad, layer, workpoint_id`；途中作业位为 null。
 - 物品：`id, kind, owner_color, holder_id, location, disabled_for_use, version, support_id, orientation`。`kind` 为 `box / cap / ball`；箱体没有预设塔基中段类型。`location` 用稳定字符串，如 `stock`、`transit:red`、`buffer:red:BOX_LOWER`、`held:red_br`、`tower:L1_PUBLIC_1:base`、`disabled:L1:red`、`out`。`support_id` 可为机器人 ID、下层物品 ID 或 `green:塔号`。
 - 摞关系：`id, version, bottom_item_id, top_item_id, intact, holder_id, source_bay_id`；不是额外物品。两个箱体各自库存、持有、计分。
@@ -82,10 +84,12 @@ SDK 导出 `Strategy, Action, Quote, Decision, Observation, StrategyAPI`。`Acti
 
 ## 7. 运行器、服务和测试边界
 
-`runner.run_match(red_path, blue_path, config=None, output_dir=None) -> dict`：开两个持久子进程，先 on_start，再每帧给相同快照各调用 on_step。收齐或判错后才 step。硬超时终止实例技术判负；已返回的异常可连续三帧判负。启动预算与回调预算分开；标准输出由 worker 处理为结构化协议，作者打印走限额诊断。
+`runner.run_match(red_path, blue_path, config=None, output_dir=None, frame=None) -> dict`：开两个持久子进程，先 on_start，再每帧给相同快照各调用 on_step。收齐或判错后才 step。硬超时终止实例技术判负；已返回的异常可连续三帧判负。启动预算与回调预算分开；标准输出由 worker 处理为结构化协议，作者打印走限额诊断。`frame` 是帧存储选项（关键帧间隔等），来自平台配置。
 
-`python -m robocon_sim demo` 跑两份基线；`match --red ... --blue ...` 单局；`series` 换边双局和10局场景；`replay` 核验已接受命令重演；`serve --host 127.0.0.1 --port 8765 --trusted-code` 本机队内模式。子进程限时不等于安全沙箱：未具备容器／VM 隔离时不开放匿名上传或外网绑定，文档明确真实限制。
+快照写入 `snapshots.rcf`（`frame_codec.py`，`rcf/1`）：静态块只存一次（`map` 与 `parameters`），逐帧只存与上一帧的差异，每 100 帧一个自包含关键帧（字符串驻留表在关键帧处重置），文件尾是帧索引。编解码必须保持生产者的 dict 键顺序——计分账本按 `towers` 的迭代顺序生成，排序会让重演结果与记录不一致。每条记录带 crc32，只用于发现意外损坏。
 
-Web 提供上传策略版本、选择两方、创建对战／换边系列、任务状态、2.5D 地图回放与时间轴、事件和回执、逐件分项、排行榜。回放只读内核快照，不能另写计分。使用 SQLite 保存队伍、版本、系列占用和唯一结算，双局完整一次事务更新 Elo、重复完成不重复加分，平台失败重跑／整组作废不扣分。
+`python -m robocon_sim demo` 跑两份基线；`match --red ... --blue ...` 单局；`series` 换边双局和10局场景；`replay` 重演核验；`dump` 打印某帧或帧索引；`serve --host 127.0.0.1 --port 8765 --trusted-code` 本机队内模式。`--config` 指向平台配置文件（`platform_config.py`），文件变更在**创建对战前**生效，已创建的对局在 `series.matches` 冻结。子进程限时不等于安全沙箱：未具备容器／VM 隔离时不开放匿名上传或外网绑定，文档明确真实限制。
 
-测试至少覆盖运动手算、只读快照、整摞取放、旧报价、接触争用、资格、翻顶、球、供料背压、故障和重试、精确终场、进程超时、命令重演、双局一次结算、HTTP上传与回放。具体失败案例优先于照抄实现的测试。实现未覆盖事项须在运行说明列明，不声称已实现或通过。
+Web 提供上传策略版本、选择两方、创建对战／换边系列、任务状态、2.5D 地图回放与时间轴、事件和回执、逐件分项、排行榜。回放只读内核快照，不能另写计分。`/api/replay` 只返回元数据与帧时间轴，`/api/replay/frames` 按 50 帧分块提供状态。使用 SQLite 保存队伍、版本、系列占用和唯一结算，双局完整一次事务更新 Elo、重复完成不重复加分，平台失败重跑／整组作废不扣分。schema 由 `PRAGMA user_version=1` 守卫，版本不符直接拒绝加载，不做迁移。
+
+测试至少覆盖运动手算、只读快照、整摞取放、旧报价、接触争用、资格、翻顶、球、供料背压、故障和重试、精确终场、进程超时、命令重演、帧编解码往返与损坏检测、配置热加载与回退、双局一次结算、HTTP上传与回放。具体失败案例优先于照抄实现的测试。实现未覆盖事项须在运行说明列明，不声称已实现或通过。

@@ -5,8 +5,21 @@ from .runner import run_match
 from .replay import verify_replay
 
 def _platform(path):
-    from .platform_config import ConfigStore
-    return ConfigStore(Path(path) if path else Path('data/l1-reach/platform.json')).current()
+    """Accept either a full platform document or a bare single-match configuration."""
+    from copy import deepcopy
+    from .config import MatchConfig
+    from .platform_config import ConfigStore, DEFAULT_SCENARIOS, FrameOptions, PlatformConfig
+    target = Path(path) if path else Path('data/l1-reach/platform.json')
+    if target.is_file():
+        try:
+            document = json.loads(target.read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            document = None
+        if isinstance(document, dict) and 'default_match' not in document:
+            return PlatformConfig(default_match=MatchConfig.from_dict(document),
+                                  scenarios=deepcopy(DEFAULT_SCENARIOS),
+                                  frame=FrameOptions(), path=str(target))
+    return ConfigStore(target).current()
 
 def main(argv: list[str] | None=None) -> None:
     parser = argparse.ArgumentParser(description='BR strategy arena — local reviewed Python code only')

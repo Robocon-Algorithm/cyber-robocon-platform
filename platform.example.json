@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "default_match": {
+    "duration_ms": 180000,
+    "tick_ms": 100,
+    "seed": 0,
+    "parameters": {},
+    "supply_delays_ms": {
+      "red": 9000,
+      "blue": 10000
+    },
+    "faults": [],
+    "auto_entry": true
+  },
+  "scenarios": {
+    "1": [
+      {}
+    ],
+    "2": [
+      {}
+    ],
+    "10": [
+      {
+        "supply_delays_ms": {
+          "red": 9000,
+          "blue": 10000
+        }
+      },
+      {
+        "supply_delays_ms": {
+          "red": 8000,
+          "blue": 11000
+        }
+      },
+      {
+        "supply_delays_ms": {
+          "red": 11000,
+          "blue": 9000
+        }
+      },
+      {
+        "supply_delays_ms": {
+          "red": 9500,
+          "blue": 10500
+        }
+      },
+      {
+        "supply_delays_ms": {
+          "red": 9000,
+          "blue": 10000
+        },
+        "faults": [
+          {
+            "team": "red",
+            "role": "TR",
+            "material_kind": "box",
+            "occurrence": 1,
+            "mode": "upper_slip",
+            "phase": "transport"
+          }
+        ]
+      }
+    ]
+  },
+  "frame": {
+    "keyframe_interval": 100,
+    "max_keyframe_bytes": 65536,
+    "max_delta_ops": 512,
+    "flush_interval": 100
+  }
+}
