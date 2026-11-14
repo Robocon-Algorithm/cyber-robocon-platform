@@ -29,6 +29,29 @@ class ServerTests(unittest.TestCase):
     def test_loopback_and_trusted_requirements(self):
         with self.assertRaises(ValueError):make_server(self.temp.name,host='0.0.0.0',trusted_code=True)
         with self.assertRaises(ValueError):make_server(self.temp.name)
+    def test_config_endpoint_and_queued_job_freeze(self):
+        from pathlib import Path
+        from robocon_sim.platform_config import platform_dict
+        from robocon_sim.storage import Storage
+        token=json.load(urlopen(self.url+'/api/bootstrap'))['token']
+        source='from brsdk import Strategy\nclass MyStrategy(Strategy):\n def on_step(self,obs,api): return None\n'
+        a=json.load(self.post('/api/upload',{'team_name':'A','filename':'a.py','source':source},token))
+        b=json.load(self.post('/api/upload',{'team_name':'B','filename':'b.py','source':source},token))
+        config=json.load(urlopen(self.url+'/api/config'))
+        self.assertEqual(config['schema'],1)
+        self.assertEqual(config['warnings'],[])
+        path=Path(self.temp.name)/'platform.json'
+        path.write_text(json.dumps({**platform_dict(),'default_match':{'duration_ms':2000}}),encoding='utf-8')
+        reply=json.load(self.post('/api/jobs',{'a_version':a['id'],'b_version':b['id'],'count':2},token))
+        job=Storage(self.temp.name).job(reply['id'])
+        self.assertEqual([m['duration_ms'] for m in job['matches']],[2000,2000])
+        path.write_text(json.dumps({**platform_dict(),'default_match':{'duration_ms':9000}}),encoding='utf-8')
+        self.assertEqual([m['duration_ms'] for m in Storage(self.temp.name).job(reply['id'])['matches']],[2000,2000])
+        path.write_text('{ broken',encoding='utf-8')
+        config=json.load(urlopen(self.url+'/api/config'))
+        self.assertEqual(len(config['warnings']),1)
+        self.assertEqual(config['default_match']['duration_ms'],2000)
+
     def test_replay_metadata_and_frame_chunks(self):
         import contextlib,io
         from robocon_sim.cli import main as cli

@@ -10,6 +10,7 @@ from urllib.parse import urlparse, parse_qs
 from .storage import Storage, MAX_UPLOAD
 from .runner import run_match, file_hash
 from .frame_codec import FrameReader
+from .platform_config import ConfigStore, SCHEMA_VERSION
 from .replay import event_feed
 from .report import series_summary
 WEB_ROOT = Path(__file__).resolve().parent / 'web'
@@ -17,17 +18,8 @@ if not WEB_ROOT.is_dir():
     WEB_ROOT = WEB_ROOT.parent.parent / 'web'
 FRAME_CHUNK = 50
 
-def scenario(config: Any, index: int, count: int) -> dict[str, Any]:
-    data = dict(config)
-    data['seed'] = int(data.get('seed', 0)) + index // 2
-    if count == 10:
-        pair = index // 2
-        data['supply_delays_ms'] = [{'red': 9000, 'blue': 10000}, {'red': 8000, 'blue': 11000}, {'red': 11000, 'blue': 9000}, {'red': 9500, 'blue': 10500}, {'red': 9000, 'blue': 10000}][pair]
-        if pair == 4 and (not data.get('faults')):
-            data['faults'] = [{'team': 'red', 'role': 'TR', 'material_kind': 'box', 'occurrence': 1, 'mode': 'upper_slip', 'phase': 'transport'}]
-    return data
-
-def execute_job(storage: Any, job: Any) -> list[dict[str, Any]]:
+def execute_job(storage: Any, job: Any, frame: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Run a claimed series. Every match config was frozen when the job was created."""
     results = []
     for index in range(job['count']):
         if [file_hash(path) for path in job['paths']] != job['strategy_hashes']:
@@ -35,7 +27,7 @@ def execute_job(storage: Any, job: Any) -> list[dict[str, Any]]:
         a, b = job['paths']
         red, blue = (a, b) if index % 2 == 0 else (b, a)
         output = storage.root / 'runs' / job['id'] / job['lease'] / str(index)
-        result = run_match(red, blue, scenario(job['config'], index, job['count']), output)
+        result = run_match(red, blue, job['matches'][index], output, frame)
         result['replay_index'] = index
         results.append(result)
     if storage.finish(job['id'], job['lease'], results):
@@ -53,8 +45,9 @@ def execute_job(storage: Any, job: Any) -> list[dict[str, Any]]:
 
 class Application:
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, config_path: str | Path | None = None) -> None:
         self.storage = Storage(root, recover=True)
+        self.config = ConfigStore(config_path or (Path(root) / 'platform.json'))
         self.token = secrets.token_urlsafe(32)
         self.stop = threading.Event()
         self.thread = None
@@ -75,9 +68,22 @@ class Application:
             if not job:
                 continue
             try:
-                execute_job(self.storage, job)
+                execute_job(self.storage, job, self.config.current().frame.to_dict())
             except Exception as exc:
                 self.storage.failed(job['id'], job['lease'], repr(exc))
+
+    def platform(self) -> dict[str, Any]:
+        config = self.config.current()
+        payload = config.public_dict()
+        payload['warnings'] = self.config.warnings
+        return payload
+
+    def create_job(self, a_version: str, b_version: str, count: int) -> dict[str, Any]:
+        config = self.config.current()
+        matches = config.matches(count)
+        ident = self.storage.create_series(
+            a_version, b_version, count, matches=matches, ranked=count > 1)
+        return {'id': ident, 'count': count, 'frame': config.frame.to_dict()}
 
     def bundle_dir(self, job_id: str, index: int) -> tuple[dict[str, Any], Path]:
         job = self.storage.job(job_id)
@@ -172,6 +178,9 @@ def handler_for(app: Any):
                 if route == '/api/state':
                     self.respond(200, app.storage.overview())
                     return
+                if route == '/api/config':
+                    self.respond(200, app.platform())
+                    return
                 if route == '/api/replay':
                     query = parse_qs(parsed.query)
                     self.respond(200, app.replay(query['job'][0], int(query.get('index', ['0'])[0])))
@@ -213,7 +222,7 @@ def handler_for(app: Any):
                     team = app.storage.create_team(data['team_name'])
                     result = app.storage.upload(team['id'], data['filename'], data['source'].encode('utf-8'))
                 elif route == '/api/jobs':
-                    result = {'id': app.storage.create_series(data['a_version'], data['b_version'], int(data.get('count', 2)), data.get('config'))}
+                    result = app.create_job(data['a_version'], data['b_version'], int(data.get('count', 2)))
                 else:
                     self.respond(404, {'error': 'not found'})
                     return
@@ -224,21 +233,28 @@ def handler_for(app: Any):
                 self.respond(500, {'error': 'platform write failure'})
     return Handler
 
-def make_server(root: str | Path, host: str='127.0.0.1', port: int=8765, trusted_code: bool=False, start_scheduler: bool=True) -> ThreadingHTTPServer:
+def make_server(root: str | Path, host: str='127.0.0.1', port: int=8765, trusted_code: bool=False,
+                start_scheduler: bool=True, config_path: str | Path | None=None) -> ThreadingHTTPServer:
     if not trusted_code:
         raise ValueError('review strategies first, then explicitly pass --trusted-code')
     if host != 'localhost' and (not ipaddress.ip_address(host).is_loopback):
         raise ValueError('only loopback binding is supported without a verified sandbox')
-    app = Application(root)
+    app = Application(root, config_path)
     server = ThreadingHTTPServer((host, port), handler_for(app))
     server.app = app
     if start_scheduler:
         app.start()
     return server
 
-def serve(root: str | Path='data/l1-reach', host: str='127.0.0.1', port: int=8765, trusted_code: bool=False) -> None:
-    server = make_server(root, host, port, trusted_code)
-    print('RoboCon local: http://%s:%s — reviewed team code only; process isolation is not a security sandbox' % (host, server.server_port), flush=True)
+def serve(root: str | Path='data/l1-reach', host: str='127.0.0.1', port: int=8765,
+          trusted_code: bool=False, config_path: str | Path | None=None) -> None:
+    server = make_server(root, host, port, trusted_code, config_path=config_path)
+    config = server.app.config.current()
+    print('RoboCon local: http://%s:%s — reviewed team code only; process isolation is not a security sandbox'
+          % (host, server.server_port), flush=True)
+    print('platform config: %s' % (config.path or '(built-in defaults)'), flush=True)
+    for warning in server.app.config.warnings:
+        print('config warning: %s' % warning['error'], flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

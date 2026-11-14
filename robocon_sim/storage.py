@@ -1,4 +1,5 @@
 """SQLite version freezing, team occupancy and idempotent Elo settlement."""
+from copy import deepcopy
 from typing import Any
 import ast
 import hashlib
@@ -11,6 +12,34 @@ from .config import MatchConfig, RATING_TIMING_PROFILE
 from .report import series_summary
 MAX_UPLOAD = 256 * 1024
 INITIAL_ELO = 1000
+SCHEMA_VERSION = 1
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS teams(
+    id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, active_version TEXT);
+CREATE TABLE IF NOT EXISTS versions(
+    id TEXT PRIMARY KEY, team_id TEXT NOT NULL, sha256 TEXT NOT NULL,
+    path TEXT NOT NULL, filename TEXT NOT NULL, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS series(
+    id TEXT PRIMARY KEY, a TEXT NOT NULL, b TEXT NOT NULL,
+    a_version TEXT NOT NULL, b_version TEXT NOT NULL, count INTEGER NOT NULL,
+    status TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0, lease TEXT,
+    config TEXT NOT NULL, matches TEXT NOT NULL, result TEXT, error TEXT,
+    created REAL NOT NULL, ranked INTEGER NOT NULL DEFAULT 0,
+    rating_timing_profile TEXT);
+CREATE TABLE IF NOT EXISTS occupancy(team_id TEXT PRIMARY KEY, series_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS settlements(
+    id TEXT PRIMARY KEY, series_id TEXT NOT NULL, pair_index INTEGER NOT NULL,
+    a_result REAL NOT NULL, delta REAL NOT NULL, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS attempts(
+    id TEXT PRIMARY KEY, series_id TEXT NOT NULL, number INTEGER NOT NULL,
+    status TEXT NOT NULL, error TEXT, result TEXT, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS team_ratings(
+    team_id TEXT NOT NULL REFERENCES teams(id), timing_profile TEXT NOT NULL,
+    elo REAL NOT NULL, PRIMARY KEY (team_id, timing_profile));
+CREATE INDEX IF NOT EXISTS idx_series_created ON series(created DESC);
+CREATE INDEX IF NOT EXISTS idx_series_status ON series(status);
+CREATE INDEX IF NOT EXISTS idx_versions_team ON versions(team_id);
+"""
 _TEAM_WITH_CURRENT_ELO = """
     SELECT t.id,t.name,COALESCE(r.elo,?) AS elo,t.active_version
     FROM teams AS t
@@ -32,27 +61,35 @@ class Storage:
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / 'strategies').mkdir(exist_ok=True)
         (self.root / 'runs').mkdir(exist_ok=True)
-        with self.connect() as db:
-            db.executescript('\n            CREATE TABLE IF NOT EXISTS teams(id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,elo REAL NOT NULL DEFAULT 1000,active_version TEXT);\n            CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY,team_id TEXT NOT NULL,sha256 TEXT NOT NULL,path TEXT NOT NULL,filename TEXT NOT NULL,created REAL NOT NULL);\n            CREATE TABLE IF NOT EXISTS series(id TEXT PRIMARY KEY,a TEXT NOT NULL,b TEXT NOT NULL,a_version TEXT NOT NULL,b_version TEXT NOT NULL,count INTEGER NOT NULL,status TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 0,lease TEXT,config TEXT NOT NULL,result TEXT,error TEXT,created REAL NOT NULL);\n            CREATE TABLE IF NOT EXISTS occupancy(team_id TEXT PRIMARY KEY,series_id TEXT NOT NULL);\n            CREATE TABLE IF NOT EXISTS settlements(id TEXT PRIMARY KEY,series_id TEXT NOT NULL,pair_index INTEGER NOT NULL,a_result REAL NOT NULL,delta REAL NOT NULL,created REAL NOT NULL);\n            CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY,series_id TEXT NOT NULL,number INTEGER NOT NULL,status TEXT NOT NULL,error TEXT,result TEXT,created REAL NOT NULL);\n            ')
-            db.execute('BEGIN IMMEDIATE')
-            columns = {row['name'] for row in db.execute('PRAGMA table_info(series)')}
-            if 'ranked' not in columns:
-                db.execute('ALTER TABLE series ADD COLUMN ranked INTEGER NOT NULL DEFAULT 0')
-            db.execute(
-                'CREATE TABLE IF NOT EXISTS team_ratings('
-                'team_id TEXT NOT NULL REFERENCES teams(id),timing_profile TEXT NOT NULL,elo REAL NOT NULL,'
-                'PRIMARY KEY (team_id,timing_profile))'
-            )
-            if 'rating_timing_profile' not in columns:
-                db.execute('ALTER TABLE series ADD COLUMN rating_timing_profile TEXT')
-            if recover:
+        self._initialize()
+        if recover:
+            with self.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
                 db.execute(
                     "UPDATE series SET status=CASE WHEN attempt<2 THEN 'QUEUED' ELSE 'VOID' END,"
                     "lease=NULL,error='scheduler restarted' WHERE status='RUNNING'"
                 )
                 db.execute("DELETE FROM occupancy WHERE series_id IN (SELECT id FROM series WHERE status='VOID')")
-            if recover:
                 db.execute("UPDATE attempts SET status='VOID',error='scheduler restarted' WHERE status='RUNNING'")
+
+    def _initialize(self) -> None:
+        """Create the current schema, and refuse to touch anything older."""
+        with self.connect() as db:
+            version = db.execute('PRAGMA user_version').fetchone()[0]
+            tables = db.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchone()[0]
+            if version == 0 and tables:
+                raise ValueError(
+                    'incompatible database (unversioned schema); delete the data directory to start over')
+            if version not in (0, SCHEMA_VERSION):
+                raise ValueError(
+                    f'incompatible database (schema {version}, expected {SCHEMA_VERSION}); '
+                    'delete the data directory to start over')
+            if version == 0:
+                db.executescript(SCHEMA)
+                db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
+                db.commit()
 
     def connect(self) -> ManagedConnection:
         db = sqlite3.connect(self.root / 'platform.sqlite3', timeout=30, factory=ManagedConnection)
@@ -110,9 +147,7 @@ class Storage:
 
     def _job(self, row: Any):
         data = dict(row)
-        if data['ranked'] and data['rating_timing_profile'] is None:
-            data['rating_timing_profile'] = 'legacy'
-        for field in ('config', 'result'):
+        for field in ('config', 'result', 'matches'):
             if data.get(field):
                 data[field] = json.loads(data[field])
         if data.get('result'):
@@ -122,14 +157,28 @@ class Storage:
     def create_series(
         self, a_version: str, b_version: str, count: int = 2,
         config: dict[str, Any] | None = None, *, ranked: bool | None = None,
+        matches: list[dict[str, Any]] | None = None,
     ) -> str:
+        """Freeze one series; every match config is stored so hot reload cannot leak in.
+
+        `matches` is the expanded per-match list produced from the platform
+        configuration. `config` is a convenience override applied to every match
+        and is kept so direct callers (CLI training runs, tests) stay short.
+        """
         if count not in (1, 2, 10):
             raise ValueError('match count must be 1, 2 or 10')
+        defaulted = matches is None
+        if defaulted:
+            frozen = MatchConfig.from_dict(config or {}).to_dict()
+            matches = [deepcopy(frozen) for _ in range(count)]
+        else:
+            matches = [MatchConfig.from_dict(item).to_dict() for item in matches]
+            if len(matches) != count:
+                raise ValueError('matches must describe every game in the series')
         if ranked is None:
-            ranked = count > 1 and not config
-        if ranked and (count == 1 or config):
+            ranked = count > 1 and config is None and defaulted
+        if ranked and (count == 1 or config is not None):
             raise ValueError('ranked matches require the default 2- or 10-match format')
-        frozen_config = MatchConfig.from_dict(config or {}).to_dict()
         ident = uuid.uuid4().hex
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -149,10 +198,10 @@ class Storage:
                     raise ValueError('team already has an active series')
                 db.execute('INSERT INTO occupancy VALUES(?,?)', (team, ident))
             db.execute(
-                "INSERT INTO series(id,a,b,a_version,b_version,count,status,config,created,ranked,rating_timing_profile) "
-                "VALUES(?,?,?,?,?,?,'QUEUED',?,?,?,?)",
-                (ident, a, b, a_version, b_version, count, json.dumps(frozen_config), time.time(), ranked,
-                 RATING_TIMING_PROFILE if ranked else None),
+                "INSERT INTO series(id,a,b,a_version,b_version,count,status,config,matches,created,ranked,rating_timing_profile) "
+                "VALUES(?,?,?,?,?,?,'QUEUED',?,?,?,?,?)",
+                (ident, a, b, a_version, b_version, count, json.dumps(matches[0]),
+                 json.dumps(matches), time.time(), ranked, RATING_TIMING_PROFILE if ranked else None),
             )
         return ident
 
@@ -206,19 +255,13 @@ class Storage:
             db.execute('DELETE FROM occupancy WHERE series_id=?', (ident,))
             return True
 
-    def _rating(self, db: ManagedConnection, team: str, profile: str | None) -> float:
-        # Unlabelled ranked jobs were created before ratings were split by timing.
-        if profile is None:
-            return db.execute('SELECT elo FROM teams WHERE id=?', (team,)).fetchone()['elo']
+    def _rating(self, db: ManagedConnection, team: str, profile: str) -> float:
         row = db.execute(
             'SELECT elo FROM team_ratings WHERE team_id=? AND timing_profile=?', (team, profile)
         ).fetchone()
         return row['elo'] if row is not None else INITIAL_ELO
 
-    def _update_rating(self, db: ManagedConnection, team: str, profile: str | None, change: float) -> None:
-        if profile is None:
-            db.execute('UPDATE teams SET elo=elo+? WHERE id=?', (change, team))
-            return
+    def _update_rating(self, db: ManagedConnection, team: str, profile: str, change: float) -> None:
         db.execute(
             'INSERT INTO team_ratings(team_id,timing_profile,elo) VALUES(?,?,?) '
             'ON CONFLICT(team_id,timing_profile) DO UPDATE SET elo=team_ratings.elo+?',

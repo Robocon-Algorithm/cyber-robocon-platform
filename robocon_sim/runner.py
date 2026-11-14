@@ -210,7 +210,8 @@ class PolicyProcess:
                 except Exception:
                     pass
 
-def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, output_dir: str | Path | None=None) -> dict[str, Any]:
+def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, output_dir: str | Path | None=None,
+              frame: dict[str, Any] | None = None) -> dict[str, Any]:
     """Run both policies at every common boundary and stream a replay bundle.
 
     Unexpected I/O and kernel failures propagate, allowing the scheduler to retry
@@ -267,7 +268,7 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
         output / 'snapshots.rcf',
         {'map': initial_state['map'], 'parameters': initial_state['parameters'],
          'ruleset_version': initial_state.get('ruleset_version'), 'match_id': match_id},
-        tick_ms=config.tick_ms, duration_ms=config.duration_ms,
+        tick_ms=config.tick_ms, duration_ms=config.duration_ms, **(frame or {}),
     )
 
     def append_log(name: str, row: Any) -> None:

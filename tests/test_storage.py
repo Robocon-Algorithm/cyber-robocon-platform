@@ -1,5 +1,6 @@
 ﻿from pathlib import Path
 import json
+import sqlite3
 import tempfile
 import unittest
 from robocon_sim.config import RATING_TIMING_PROFILE
@@ -17,43 +18,30 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(self.storage.finish(ident,job['lease'],results));self.assertFalse(self.storage.finish(ident,job['lease'],results))
         with self.storage.connect() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM settlements').fetchone()[0],1)
         ratings={t['name']:t['elo'] for t in self.storage.overview()['teams']};self.assertEqual(ratings['A'],1012);self.assertEqual(ratings['B'],988)
-    def test_legacy_database_keeps_strategies_and_settles_old_jobs_separately(self):
-        old_id = self.storage.create_series(*self.versions[:2])
-        old_config = self.storage.job(old_id)['config']
-        old_config['parameters'].update(
-            empty_speed_mm_s=1000, loaded_speed_mm_s=800, ball_speed_mm_s=600, place_ball_ms=4000,
-        )
-        with self.storage.connect() as db:
-            db.execute('ALTER TABLE series DROP COLUMN rating_timing_profile')
-            db.execute('DROP TABLE team_ratings')
-            db.execute('UPDATE teams SET elo=1234 WHERE name=?', ('A',))
-            db.execute('UPDATE series SET config=? WHERE id=?', (json.dumps(old_config), old_id))
-
-        storage = Storage(self.temp.name)
-        overview = storage.overview()
-        self.assertEqual([t['elo'] for t in overview['teams']], [1000, 1000, 1000])
-        self.assertEqual([t['active_version'] for t in overview['teams']], self.versions)
-        self.assertEqual(storage.create_team('A')['elo'], 1000)
-        old = storage.claim(old_id)
-        self.assertEqual(old['rating_timing_profile'], 'legacy')
-        self.assertEqual(old['config'], old_config)
-        results = [{'winner': 'red'}, {'winner': 'blue'}]
-        self.assertTrue(storage.finish(old_id, old['lease'], results))
-        with storage.connect() as db:
-            legacy_ratings = [r['elo'] for r in db.execute('SELECT elo FROM teams ORDER BY name')]
-        self.assertGreater(legacy_ratings[0], 1234)
-        self.assertEqual([t['elo'] for t in storage.overview()['teams']], [1000, 1000, 1000])
-
-        new_id = storage.create_series(*self.versions[:2])
-        new = storage.claim(new_id)
-        self.assertEqual(new['rating_timing_profile'], RATING_TIMING_PROFILE)
-        self.assertTrue(storage.finish(new_id, new['lease'], results))
-        self.assertEqual(
-            [(t['name'], t['elo']) for t in storage.overview()['teams']],
-            [('A', 1012), ('C', 1000), ('B', 988)],
-        )
-        with storage.connect() as db:
-            self.assertEqual([r['elo'] for r in db.execute('SELECT elo FROM teams ORDER BY name')], legacy_ratings)
+    def test_series_freezes_every_match_config(self):
+        matches=[{'duration_ms':5000},{'duration_ms':6000}]
+        ident=self.storage.create_series(*self.versions[:2],2,matches=matches,ranked=False)
+        job=self.storage.claim(ident)
+        self.assertEqual([m['duration_ms'] for m in job['matches']],[5000,6000])
+        self.assertEqual(job['config']['duration_ms'],5000)
+        self.assertFalse(job['ranked'])
+        self.assertIsNone(job['rating_timing_profile'])
+        with self.assertRaisesRegex(ValueError,'every game'):
+            self.storage.create_series(*self.versions[:2],2,matches=matches[:1],ranked=False)
+    def test_ranked_series_uses_the_timing_profile(self):
+        ident=self.storage.create_series(*self.versions[:2],2,matches=[{},{}],ranked=True)
+        self.assertEqual(self.storage.claim(ident)['rating_timing_profile'],RATING_TIMING_PROFILE)
+        with self.assertRaisesRegex(ValueError,'default'):
+            self.storage.create_series(*self.versions[:2],2,matches=[{},{}],ranked=True,config={'duration_ms':5000})
+    def test_unversioned_database_is_rejected(self):
+        root=Path(self.temp.name)/'old'
+        Storage(root)
+        db=sqlite3.connect(root/'platform.sqlite3')
+        try:
+            db.execute('PRAGMA user_version=0');db.commit()
+        finally:
+            db.close()
+        with self.assertRaisesRegex(ValueError,'incompatible'):Storage(root)
 
     def test_custom_series_does_not_enter_either_rating_profile(self):
         ident = self.storage.create_series(

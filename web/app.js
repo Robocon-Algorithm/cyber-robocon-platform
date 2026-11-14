@@ -734,6 +734,7 @@ async function boot() {
     token = data.token;
     const {teams, versions, jobs} = data;
     renderCatalog({teams, versions, jobs});
+    applyPlatformConfig();
     setInterval(async () => {
       try {
         renderCatalog(await api('/api/state'));
@@ -747,4 +748,19 @@ async function boot() {
   }
   draw({});
   requestAnimationFrame(animate);
+}
+
+/* The match length and frame cadence come from platform.json, not from the page. */
+async function applyPlatformConfig() {
+  try {
+    const config = await api('/api/config');
+    const seconds = Math.round(config.default_match.duration_ms / 1000);
+    const tick = config.default_match.tick_ms;
+    const headline = $('config-headline');
+    if (headline) headline.textContent = seconds + ' 秒 · 两台 BR · 一个时钟';
+    if (config.warnings?.length) notice('配置有误，已沿用上一份：' + config.warnings[0].error);
+    document.body.dataset.tickMs = String(tick);
+  } catch {
+    /* the page still works with its own defaults */
+  }
 }
