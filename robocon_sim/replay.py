@@ -22,6 +22,26 @@ def read_log(path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
+def event_feed(root: str | Path) -> list[dict[str, Any]]:
+    """World events merged with policy receipts and policy errors, time ordered."""
+    root = Path(root)
+    events = list(read_log(root / 'events.jsonl'))
+    known = {event.get('id') for event in events if 'id' in event}
+    for command in read_log(root / 'commands.jsonl'):
+        for team in ('red', 'blue'):
+            for receipt in (command.get('receipts') or {}).get(team) or []:
+                if receipt.get('id') in known:
+                    continue
+                known.add(receipt.get('id'))
+                events.append({**receipt, 'type': 'RECEIPT ' + str(receipt.get('code', '')), 'team': team})
+            response = (command.get('responses') or {}).get(team)
+            if response and not response.get('ok'):
+                events.append({'type': 'POLICY_ERROR', 'occurred_at_ms': command.get('sim_time_ms', 0),
+                               'team': team, 'reason': response.get('error')})
+    events.sort(key=lambda event: event.get('occurred_at_ms') or 0)
+    return events
+
+
 def verify_replay(directory: str | Path) -> dict[str, Any]:
     from .engine import Engine
     root = Path(directory)

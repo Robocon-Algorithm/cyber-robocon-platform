@@ -29,5 +29,32 @@ class ServerTests(unittest.TestCase):
     def test_loopback_and_trusted_requirements(self):
         with self.assertRaises(ValueError):make_server(self.temp.name,host='0.0.0.0',trusted_code=True)
         with self.assertRaises(ValueError):make_server(self.temp.name)
+    def test_replay_metadata_and_frame_chunks(self):
+        import contextlib,io
+        from robocon_sim.cli import main as cli
+        from robocon_sim.storage import Storage
+        with contextlib.redirect_stdout(io.StringIO()):
+            cli(['series','--red','examples/stack_builder.py','--blue','examples/stack_builder.py',
+                 '--count','2','--duration-ms','3000','--output',self.temp.name])
+        job=Storage(self.temp.name).overview()['jobs'][0]
+        app=self.server.app
+        bundle=app.replay(job['id'],0)
+        self.assertLess(len(json.dumps(bundle)),120*1024)
+        self.assertEqual(bundle['frame_count'],len(bundle['times_ms']))
+        self.assertIn('map',bundle['static'])
+        self.assertNotIn('snapshots',bundle)
+        self.assertNotIn('commands',bundle)
+        block=app.frames(job['id'],0,0,50)
+        self.assertEqual(block['start'],0)
+        self.assertEqual(len(block['frames']),min(50,bundle['frame_count']))
+        self.assertEqual(block['frames'][0]['sim_time_ms'],0)
+        tail=app.frames(job['id'],0,bundle['frame_count']-5,50)
+        self.assertEqual(tail['frames'][-1]['seq'],bundle['frame_count']-1)
+        last=app.frames(job['id'],0,bundle['frame_count']-1,1)['frames'][0]
+        self.assertEqual(last['seq'],bundle['frame_count']-1)
+        self.assertEqual(json.load(urlopen(self.url+'/api/replay?job='+job['id']+'&index=0'))['frame_count'],bundle['frame_count'])
+        chunk=json.load(urlopen(self.url+'/api/replay/frames?job='+job['id']+'&index=0&from=10&count=5'))
+        self.assertEqual([f['sim_time_ms'] for f in chunk['frames']],[1000,1100,1200,1300,1400])
+
 
 if __name__=='__main__':unittest.main()

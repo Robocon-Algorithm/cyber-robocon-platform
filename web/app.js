@@ -20,6 +20,10 @@ let playing = false;
 let playtime = 0;
 let lastTime = 0;
 let requestNumber = 0;
+let currentJob = null;
+let currentIndex = 0;
+let chunkCache = new Map();
+let frameRequest = 0;
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -181,6 +185,9 @@ async function loadReplay(job, index) {
     const bundle = await api('/api/replay?job=' + encodeURIComponent(job.id) + '&index=' + index);
     if (request !== requestNumber) return;
     replay = bundle;
+    currentJob = job;
+    currentIndex = index;
+    chunkCache = new Map();
     // The scheduler puts A on red in the first leg of each pair, then swaps.
     const [red, blue] = index % 2 === 0 ? [job.a, job.b] : [job.b, job.a];
     replayTeams = {red: teamName(red, SIDE_NAMES.red), blue: teamName(blue, SIDE_NAMES.blue)};
@@ -188,58 +195,76 @@ async function loadReplay(job, index) {
     frame = 0;
     playtime = 0;
     setPlaying(false);
-    $('timeline').max = replay.snapshots.length - 1;
+    $('timeline').max = replay.frame_count - 1;
     $('replay-label').textContent = job.id.slice(0, 8) + ' / 第 ' + (index + 1) + ' 局 / ' + replay.result.status;
     renderEvents();
     renderLedger();
     renderMetrics();
-    showFrame(0);
+    await showFrame(0);
     notice('比赛包已载入');
   } catch (error) {
     if (request === requestNumber) notice(error.message);
   }
 }
 
-function showFrame(index) {
+/* Snapshots are streamed in fixed chunks instead of one JSON blob per match. */
+async function loadChunk(start) {
+  if (chunkCache.has(start)) return chunkCache.get(start);
+  const block = await api('/api/replay/frames?job=' + encodeURIComponent(currentJob.id)
+    + '&index=' + currentIndex + '&from=' + start + '&count=' + replay.chunk);
+  if (chunkCache.size >= 4) chunkCache.delete(chunkCache.keys().next().value);
+  chunkCache.set(start, block);
+  return block;
+}
+
+function chunkStart(index) {
+  return Math.floor(index / replay.chunk) * replay.chunk;
+}
+
+async function showFrame(index) {
   if (!replay) return;
-  frame = Math.min(replay.snapshots.length - 1, Math.max(0, index));
-  const snap = replay.snapshots[frame];
+  const ticket = ++frameRequest;
+  const target = Math.min(replay.frame_count - 1, Math.max(0, index));
+  const start = chunkStart(target);
+  let block;
+  try {
+    block = await loadChunk(start);
+  } catch (error) {
+    notice(error.message);
+    return;
+  }
+  if (ticket !== frameRequest) return;
+  const snap = block.frames[target - start];
+  if (!snap) return;
+  frame = target;
   const state = snap.state;
   $('timeline').value = frame;
   $('clock').textContent = (snap.sim_time_ms / 1000).toFixed(1).padStart(5, '0');
   for (const side of SIDES) $('score-' + side).textContent = state.score?.[side]?.total ?? '—';
   const eligibility = side => state.qualified?.[side] ? '✓' : '—';
-  $('frame-detail').textContent = '帧 ' + snap.seq + ' · ' + snap.hash.slice(0, 12)
+  $('frame-detail').textContent = '帧 ' + snap.seq + ' · rev ' + state.world_revision
     + ' · 资格 R:' + eligibility('red') + ' B:' + eligibility('blue');
   draw(state);
 }
 
 function seekTime(time) {
-  const index = replay.snapshots.findIndex(snap => snap.sim_time_ms >= time);
-  showFrame(index < 0 ? replay.snapshots.length - 1 : index);
-  playtime = replay.snapshots[frame].sim_time_ms;
+  const times = replay.times_ms;
+  let low = 0;
+  let high = times.length - 1;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (times[mid] < time) low = mid + 1;
+    else high = mid;
+  }
+  showFrame(low);
+  playtime = times[low];
 }
 
 function renderEvents() {
   const container = $('events');
   container.classList.remove('empty');
   container.replaceChildren();
-  const events = [...replay.events];
-  const known = new Set(events.map(event => event.id));
-  for (const command of replay.commands) {
-    for (const team of SIDES) {
-      for (const receipt of command.receipts?.[team] || []) {
-        if (known.has(receipt.id)) continue;
-        known.add(receipt.id);
-        events.push({...receipt, type: 'RECEIPT ' + receipt.code, team});
-      }
-      const response = command.responses?.[team];
-      if (response && !response.ok) {
-        events.push({type: 'POLICY_ERROR', occurred_at_ms: command.sim_time_ms, team, reason: response.error});
-      }
-    }
-  }
-  events.sort((a, b) => (a.occurred_at_ms || 0) - (b.occurred_at_ms || 0));
+  const events = replay.events || [];
   const list = document.createDocumentFragment();
   for (const event of events) {
     const time = event.occurred_at_ms || 0;
@@ -315,13 +340,14 @@ function setPlaying(value) {
 
 $('timeline').oninput = () => {
   if (!replay) return;
-  showFrame(Number($('timeline').value));
-  playtime = replay.snapshots[frame].sim_time_ms;
+  const target = Number($('timeline').value);
+  showFrame(target);
+  playtime = replay.times_ms[target] ?? 0;
 };
 
 $('play').onclick = () => {
   if (!replay) return;
-  if (frame === replay.snapshots.length - 1) {
+  if (frame === replay.frame_count - 1) {
     showFrame(0);
     playtime = 0;
   }
@@ -334,9 +360,12 @@ function animate(time) {
   if (playing && replay) {
     playtime += delta * Number($('speed').value);
     let next = frame;
-    while (next < replay.snapshots.length - 1 && replay.snapshots[next + 1].sim_time_ms <= playtime) next++;
+    while (next < replay.frame_count - 1 && replay.times_ms[next + 1] <= playtime) next++;
     if (next !== frame) showFrame(next);
-    if (frame === replay.snapshots.length - 1) setPlaying(false);
+    // Prefetch the next chunk before playback reaches its boundary.
+    const ahead = next + replay.chunk;
+    if (ahead < replay.frame_count) loadChunk(chunkStart(ahead)).catch(() => {});
+    if (frame >= replay.frame_count - 1) setPlaying(false);
   }
   requestAnimationFrame(animate);
 }
@@ -612,7 +641,7 @@ function drawCentral(map, state, dims, z) {
 }
 
 function draw(state) {
-  const map = state.map || replay?.manifest?.map || {};
+  const map = state.map || replay?.static?.map || replay?.manifest?.map || {};
   const dims = {
     field_mm: [11000, 11000], l1_height_mm: 600, l2_height_mm: 900,
     transfer_mm: [1000, 1000], green_pad_mm: [500, 500],

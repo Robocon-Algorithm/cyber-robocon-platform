@@ -9,11 +9,13 @@ import threading
 from urllib.parse import urlparse, parse_qs
 from .storage import Storage, MAX_UPLOAD
 from .runner import run_match, file_hash
-from .replay import read_log
+from .frame_codec import FrameReader
+from .replay import event_feed
 from .report import series_summary
 WEB_ROOT = Path(__file__).resolve().parent / 'web'
 if not WEB_ROOT.is_dir():
     WEB_ROOT = WEB_ROOT.parent.parent / 'web'
+FRAME_CHUNK = 50
 
 def scenario(config: Any, index: int, count: int) -> dict[str, Any]:
     data = dict(config)
@@ -56,6 +58,7 @@ class Application:
         self.token = secrets.token_urlsafe(32)
         self.stop = threading.Event()
         self.thread = None
+        self._readers: dict[tuple[str, int, float], FrameReader] = {}
 
     def start(self) -> None:
         self.thread = threading.Thread(target=self.schedule, daemon=True)
@@ -76,7 +79,7 @@ class Application:
             except Exception as exc:
                 self.storage.failed(job['id'], job['lease'], repr(exc))
 
-    def replay(self, job_id: str, index: int) -> dict[str, Any]:
+    def bundle_dir(self, job_id: str, index: int) -> tuple[dict[str, Any], Path]:
         job = self.storage.job(job_id)
         if not job.get('result') or not 0 <= index < len(job['result']):
             raise ValueError('replay not available')
@@ -85,7 +88,52 @@ class Application:
         run_root = (self.storage.root / 'runs').resolve()
         if not path.is_relative_to(run_root):
             raise ValueError('invalid replay path')
-        return {'result': result, 'manifest': json.loads((path / 'manifest.json').read_text(encoding='utf-8')), 'snapshots': read_log(path / 'snapshots.jsonl'), 'events': read_log(path / 'events.jsonl'), 'commands': read_log(path / 'commands.jsonl'), 'ledger': json.loads((path / 'score_ledger.json').read_text(encoding='utf-8'))}
+        return result, path
+
+    def reader(self, path: Path) -> FrameReader:
+        """A frame file is ~1 MB; keep a few decoded indexes instead of re-reading."""
+        target = path / 'snapshots.rcf'
+        key = (str(target), target.stat().st_mtime_ns, target.stat().st_size)
+        reader = self._readers.get(key)
+        if reader is None:
+            if len(self._readers) >= 4:
+                self._readers.clear()
+            reader = FrameReader(target)
+            self._readers[key] = reader
+        return reader
+
+    def replay(self, job_id: str, index: int) -> dict[str, Any]:
+        result, path = self.bundle_dir(job_id, index)
+        reader = self.reader(path)
+        meta = reader.meta()
+        manifest = json.loads((path / 'manifest.json').read_text(encoding='utf-8'))
+        manifest.pop('map', None)   # identical to static["map"], do not ship it twice
+        return {
+            'result': result,
+            'manifest': manifest,
+            'ledger': json.loads((path / 'score_ledger.json').read_text(encoding='utf-8')),
+            'events': event_feed(path),
+            'static': reader.static,
+            'frame_count': reader.frame_count,
+            'chunk': FRAME_CHUNK,
+            'times_ms': [row['sim_time_ms'] for row in meta],
+            'keyframes': [row['frame'] for row in meta if row['keyframe']],
+        }
+
+    def frames(self, job_id: str, index: int, start: int, count: int) -> dict[str, Any]:
+        _result, path = self.bundle_dir(job_id, index)
+        reader = self.reader(path)
+        count = max(1, min(int(count), 200))
+        start = max(0, min(int(start), max(0, reader.frame_count - 1)))
+        states = reader.states(start, count)
+        return {
+            'start': start,
+            'count': len(states),
+            'frames': [
+                {'seq': state.get('seq'), 'sim_time_ms': state.get('sim_time_ms'), 'state': state}
+                for state in states
+            ],
+        }
 
 def handler_for(app: Any):
 
@@ -127,6 +175,12 @@ def handler_for(app: Any):
                 if route == '/api/replay':
                     query = parse_qs(parsed.query)
                     self.respond(200, app.replay(query['job'][0], int(query.get('index', ['0'])[0])))
+                    return
+                if route == '/api/replay/frames':
+                    query = parse_qs(parsed.query)
+                    self.respond(200, app.frames(
+                        query['job'][0], int(query.get('index', ['0'])[0]),
+                        int(query.get('from', ['0'])[0]), int(query.get('count', [FRAME_CHUNK])[0])))
                     return
                 files = {'/': ('index.html', 'text/html; charset=utf-8'), '/app.js': ('app.js', 'application/javascript; charset=utf-8'), '/style.css': ('style.css', 'text/css; charset=utf-8')}
                 if route not in files:
