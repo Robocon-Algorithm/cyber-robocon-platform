@@ -307,9 +307,10 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
                 }
                 if failures:
                     engine.fail_policies(failures)
+                    next_public = engine.public_state()
                 else:
-                    engine.step(decisions)
-                next_observations = engine.observations()
+                    next_public = engine.step(decisions, observations)
+                next_observations = engine.observations(next_public)
                 frame_record['receipts'] = {
                     team: next_observations[team]['receipts']
                     for team in ('red', 'blue')
@@ -317,11 +318,7 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
                 metrics.interval(observations, engine.sim_time_ms - frame_record['sim_time_ms'])
                 metrics.receipts(frame_record['receipts'])
                 append_log('commands', frame_record)
-                public = {
-                    key: value for key, value in next_observations['red'].items()
-                    if key not in ('self', 'opponent', 'receipts')
-                }
-                checkpoint(public)
+                checkpoint(next_public)
                 observations = next_observations
         result = engine.result()
         result.update({'match_id': match_id, 'output_dir': str(output), 'final_hash': digest(engine.public_state())})

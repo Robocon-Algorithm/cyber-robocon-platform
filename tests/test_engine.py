@@ -75,6 +75,27 @@ class EngineTests(unittest.TestCase):
         self.assertNotIn("faults", obs["red"])
         self.assertNotIn("seed", obs["red"])
 
+    def test_statics_are_shared_and_never_copied(self):
+        e = self.make()
+        snap = e.public_state()
+        for key in ("map", "parameters"):
+            self.assertIs(snap[key], e.world[key])
+        obs = e.observations()
+        self.assertIs(obs["red"]["map"], obs["blue"]["map"])
+        self.assertIs(obs["red"]["parameters"], e.world["parameters"])
+        e.step({})
+        self.assertIs(e.public_state()["map"], e.world["map"])
+        self.assertEqual(e.result()["ruleset_version"], snap["ruleset_version"])
+
+    def test_motion_state_does_not_duplicate_action_segments(self):
+        e = self.make()
+        e.step({"red": decision(e, "red", "move_to", point_id="RED_ENTRY")})
+        advance(e, 3300)
+        me = e.observations()["red"]["self"]
+        self.assertTrue(me["action"]["segments"])
+        self.assertNotIn("segments", me["motion_state"])
+        self.assertGreater(me["motion_state"]["speed_mm_s"], 0)
+
     def test_old_quote_and_private_receipts(self):
         e = self.make()
         cmd = decision(e, "red", "move_to", point_id="RED_ENTRY")

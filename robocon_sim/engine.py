@@ -4,7 +4,9 @@ from __future__ import annotations
 from collections import defaultdict
 from copy import deepcopy
 import heapq
+import json
 from typing import Any
+import zlib
 
 from .config import MatchConfig
 from .map import default_map
@@ -16,12 +18,20 @@ from .faults import Faults
 from .operations import Operations
 
 
+_SHARED_KEYS = ("map", "parameters")
+
+
 def _public(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: _public(v) for k, v in value.items() if not k.startswith("_")}
     if isinstance(value, list):
         return [_public(v) for v in value]
     return deepcopy(value)
+
+
+def _static_stamp(value: Any) -> int:
+    """Cheap non-cryptographic guard against in-place mutation of shared statics."""
+    return zlib.crc32(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
 
 
 class Engine:
@@ -35,6 +45,10 @@ class Engine:
         self.world_revision = 0
         self.world = make_world(map_data or default_map(), self.config.auto_entry)
         self.world["parameters"] = deepcopy(self.config.parameters)
+        # Published read-only statics: shared by reference with every snapshot
+        # instead of being copied 2-3 times per frame. Guarded by _static_stamp.
+        self._statics = {key: self.world[key] for key in _SHARED_KEYS}
+        self._static_stamps = {key: _static_stamp(value) for key, value in self._statics.items()}
         self._queue = []
         self._event_serial = 0
         self._action_serial = 0
@@ -90,7 +104,7 @@ class Engine:
         self.schedule(duration, "action_done", team=team, action_id=action["id"])
         self.emit("ENTRY_STARTED", team=team, expected_end_ms=duration)
 
-    def _audit(self):
+    def _audit(self, score: bool = True):
         sync_cargo(self.world)
         for t in self.world["towers"].values():
             if t["cap"]:
@@ -99,41 +113,58 @@ class Engine:
                 t["top_color"] = None
         for team in update_qualification(self.world):
             self.emit("QUALIFIED", team=team, rule="3.6.1 / 3.6.2")
-        self.world["score"] = score_world(self.world, self.done)
+        if score:
+            # Full re-scoring is only needed at published boundaries and at the
+            # final result. `world_revision` must NOT be used as a dirty flag:
+            # relocate(), tower writes and ops.contact() mutate the world without
+            # emitting an event, so a revision-based skip would silently miss them.
+            self.world["score"] = score_world(self.world, self.done)
 
     def _update_motion(self):
         for r in self.world["robots"].values():
             a = r["action"]
             if not a:
                 r["motion_state"] = {"speed_mm_s": 0, "linear_speed_mm_s": 0,
-                                     "vx_mm_s": 0, "vy_mm_s": 0, "angular_speed_mrad_s": 0, "segments": [],
+                                     "vx_mm_s": 0, "vy_mm_s": 0, "angular_speed_mrad_s": 0,
                                      "braking_model": "constant-deceleration-v1"}
                 continue
             state = motion_at(a["segments"], self.sim_time_ms - a["started_at_ms"])
             if state["pose"] is not None:
                 r["pose"] = state.pop("pose")
+            # The segment list is already published verbatim as r["action"]["segments"];
+            # duplicating it here cost 3.4 KB per frame and had no consumer.
             r["motion_state"] = {**state, "linear_speed_mm_s": state["speed_mm_s"],
-                                 "segments": deepcopy(a["segments"]), "braking_model": "constant-deceleration-v1"}
+                                 "braking_model": "constant-deceleration-v1"}
             if a["kind"] in ("move_to", "entry", "traverse") and a["cancel_state"] != "BRAKING":
                 a["phase"] = state.get("segment_kind", "moving")
 
     def public_state(self) -> dict[str, Any]:
         self._update_motion()
         self._audit()
-        return _public({**self.world, "seq": self.seq, "sim_time_ms": self.sim_time_ms,
-                        "world_revision": self.world_revision, "remaining_ms": max(0, self.config.duration_ms - self.sim_time_ms),
-                        "done": self.done, "ruleset_version": RULESET_VERSION,
-                        "events": self.events[self._event_window_start:]})
+        body = {k: v for k, v in self.world.items() if k not in _SHARED_KEYS}
+        body.update({"seq": self.seq, "sim_time_ms": self.sim_time_ms,
+                     "world_revision": self.world_revision,
+                     "remaining_ms": max(0, self.config.duration_ms - self.sim_time_ms),
+                     "done": self.done, "ruleset_version": RULESET_VERSION,
+                     "events": self.events[self._event_window_start:]})
+        public = _public(body)
+        public.update(self._statics)
+        return public
 
-    def observations(self) -> dict[str, dict[str, Any]]:
-        shared = self.public_state()
+    def observations(self, shared: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+        shared = self.public_state() if shared is None else shared
         result = {}
         for team in TEAMS:
-            obs = deepcopy(shared)
-            obs["self"] = deepcopy(obs["robots"][team + "_br"])
             other = "blue" if team == "red" else "red"
-            obs["opponent"] = deepcopy(obs["robots"][other + "_br"])
-            obs["receipts"] = deepcopy(self._receipts[team][self._receipt_window_start[team]:])
+            obs = dict(shared)
+            # Only the two robot subtrees are copied per team; every other value is
+            # written once by the audit and never mutated afterwards. This keeps the
+            # per-team envelope independent (pose edits do not leak across teams)
+            # without deep-copying the whole 30-45 KB world twice.
+            obs["robots"] = {robot_id: deepcopy(robot) for robot_id, robot in shared["robots"].items()}
+            obs["self"] = obs["robots"][team + "_br"]
+            obs["opponent"] = obs["robots"][other + "_br"]
+            obs["receipts"] = [dict(r) for r in self._receipts[team][self._receipt_window_start[team]:]]
             result[team] = obs
         return result
 
@@ -172,7 +203,7 @@ class Engine:
         try:
             require(primary.get("kind") in ("execute", "cancel"), "INVALID_DECISION", "unknown primary command")
             if primary["kind"] == "cancel":
-                self._cancel(team, primary.get("action_id"), command)
+                self._cancel(team, primary.get("action_id"), command, obs)
                 return
             require(primary.get("quote_seq") == self.seq, "STALE_OBSERVATION", "quote is from an old frame")
             require(not primary.get("preview_only"), "PREVIEW_ONLY", "braking previews cannot execute")
@@ -208,14 +239,16 @@ class Engine:
         self.faults.arm(team, "BR", action["kind"], ids, action["id"],
                         action["expected_end_ms"] - self.sim_time_ms, risk_start_ms=self.sim_time_ms)
 
-    def _cancel(self, team, action_id, command):
+    def _cancel(self, team, action_id, command, obs=None):
         r = self.world["robots"][team + "_br"]
         a = r["action"]
         require(a and a["id"] == action_id, "TARGET_CHANGED", "action no longer active")
         require(a["kind"] != "entry", "NOT_CANCELLABLE", "automatic entry must finish at its safe L1 node")
         require(a["cancel_state"] == "NONE", "CANCEL_PENDING", "safe stop already requested")
         if a["kind"] == "move_to":
-            stop, segments = braking_preview(self.observations()[team])
+            # Reuse the envelope already frozen for this decision instead of
+            # rebuilding the whole public state just to read the self subtree.
+            stop, segments = braking_preview(obs if obs is not None else self.observations()[team])
             if not segments:
                 segments = [{"kind": "wait", "start_ms": 0, "end_ms": 1,
                              "from_pose": deepcopy(r["pose"]), "to_pose": stop}]
@@ -384,12 +417,19 @@ class Engine:
         blocked = self._contacts([entry for entry in entries if entry[2] == "contact"])
         for team in TEAMS:
             self.supplies.try_deliver(team, blocked.get(team, ()))
-        self._audit()
+        self._audit(score=False)
 
-    def step(self, decisions: dict[str, dict[str, Any] | None]) -> None:
+    def step(self, decisions: dict[str, dict[str, Any] | None], observations: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Advance one common boundary and return the published state of that boundary.
+
+        Pass `observations` (the envelopes handed to the policies for this boundary)
+        to avoid rebuilding them; the returned snapshot is the single public state
+        of this frame and should be reused by the caller instead of calling
+        `public_state()` again.
+        """
         if self.done:
-            return
-        observations = self.observations()
+            return self.public_state()
+        observations = self.observations() if observations is None else observations
         self._event_window_start = len(self.events)
         self._receipt_window_start = {team: len(self._receipts[team]) for team in TEAMS}
         # All quotes see the two frozen envelopes, never the prior command's world.
@@ -416,7 +456,7 @@ class Engine:
             # Backpressure may clear precisely at a decision boundary.
             for team in TEAMS:
                 self.supplies.try_deliver(team)
-        self._audit()
+        return self.public_state()
 
     def fail_policies(self, failures: dict[str, str]) -> None:
         if self.done or not failures:
@@ -433,6 +473,9 @@ class Engine:
 
     def result(self) -> dict[str, Any]:
         self._audit()
+        for key, stamp in self._static_stamps.items():
+            if self.world.get(key) is not self._statics[key] or _static_stamp(self._statics[key]) != stamp:
+                raise RuntimeError(f"shared static '{key}' was mutated in place; published snapshots are no longer valid")
         scores = self.world["score"]
         winner, ties = tiebreak(self.world, scores)
         if self._technical_failures:

@@ -33,7 +33,7 @@ def make_world(map_data: dict[str, Any], auto_entry: bool = True) -> dict[str, A
         pose = point_pose(map_data, team.upper() + ("_START" if auto_entry else "_TRANSFER"))
         robots[rid] = {"id": rid, "team": team, "pose": pose,
                        "motion_state": {"speed_mm_s": 0, "linear_speed_mm_s": 0,
-                                        "angular_speed_mrad_s": 0, "segments": []},
+                                        "angular_speed_mrad_s": 0},
                        "cargo": [], "carried_stack_id": None,
                        "control_state": "INIT" if auto_entry else "READY", "action": None}
     supply = {team: {"slots": dict.fromkeys(SLOTS), "slot_versions": dict.fromkeys(SLOTS, 0),
