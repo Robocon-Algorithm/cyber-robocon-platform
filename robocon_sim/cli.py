@@ -21,6 +21,11 @@ def main(argv: list[str] | None=None) -> None:
             p.add_argument('--count', type=int, choices=(2, 10), default=2)
     p = sub.add_parser('replay')
     p.add_argument('directory')
+    p = sub.add_parser('dump', help='print decoded frames from a match bundle')
+    p.add_argument('directory')
+    p.add_argument('--frame', type=int, default=0)
+    p.add_argument('--count', type=int, default=1)
+    p.add_argument('--meta', action='store_true', help='list the frame index instead of states')
     p = sub.add_parser('serve')
     p.add_argument('--host', default='127.0.0.1')
     p.add_argument('--port', type=int, default=8765)
@@ -33,6 +38,15 @@ def main(argv: list[str] | None=None) -> None:
         return
     if args.command == 'replay':
         result = verify_replay(args.directory)
+    elif args.command == 'dump':
+        from .frame_codec import FrameReader
+        reader = FrameReader(Path(args.directory) / 'snapshots.rcf')
+        if args.meta:
+            result = {'static_keys': sorted(reader.static), 'frames': reader.meta()}
+        else:
+            result = reader.states(args.frame, args.count, include_static=True)
+            if args.count == 1:
+                result = result[0]
     elif args.command == 'demo':
         base = Path(__file__).resolve().parent.parent / 'examples'
         result = run_match(base / 'stack_builder.py', base / 'adaptive_raider.py', {'duration_ms': args.duration_ms}, args.output)

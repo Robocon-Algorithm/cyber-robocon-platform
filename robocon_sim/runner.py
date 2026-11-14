@@ -14,9 +14,12 @@ import sys
 import threading
 import time
 import uuid
+import zlib
 
+from .frame_codec import STATIC_KEYS, FrameWriter
 from .report import MatchMetrics
 MAX_MESSAGE = 2 * 1024 * 1024
+BUNDLE_FORMAT = 'rcf/1'
 BUDGETS = {
     'cpu_ms': 20,
     'wall_ms': 200,
@@ -39,6 +42,20 @@ def write_json(path: str | Path, value: Any) -> None:
 def file_hash(path: str | Path) -> str:
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+def file_crc32(path: str | Path) -> tuple[int, int]:
+    """Return (size, crc32) without loading the file into memory."""
+    checksum = 0
+    size = 0
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b''):
+            size += len(chunk)
+            checksum = zlib.crc32(chunk, checksum)
+    return size, checksum & 0xFFFFFFFF
+
+def frame_state(state: dict[str, Any]) -> dict[str, Any]:
+    """The per-frame payload: everything except the published statics."""
+    return {key: value for key, value in state.items() if key not in STATIC_KEYS}
 
 class PolicyFailure(Exception):
     """An author process failed; infrastructure exceptions use other types."""
@@ -212,6 +229,7 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
     initial_state = engine.public_state()
     manifest = {
         'id': match_id,
+        'bundle_format': BUNDLE_FORMAT,
         'protocol_version': PROTOCOL_VERSION,
         'sdk_version': SDK_VERSION,
         'ruleset_version': initial_state.get('ruleset_version'),
@@ -242,19 +260,27 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
     write_json(output / 'manifest.json', manifest)
     policies = {}
     diagnostics = []
-    streams = {name: (output / (name + '.jsonl')).open('w', encoding='utf-8') for name in ('commands', 'snapshots')}
+    streams = {name: (output / (name + '.jsonl')).open('w', encoding='utf-8') for name in ('commands',)}
     counts = {name: 0 for name in streams}
     metrics = MatchMetrics()
+    frames = FrameWriter(
+        output / 'snapshots.rcf',
+        {'map': initial_state['map'], 'parameters': initial_state['parameters'],
+         'ruleset_version': initial_state.get('ruleset_version'), 'match_id': match_id},
+        tick_ms=config.tick_ms, duration_ms=config.duration_ms,
+    )
 
     def append_log(name: str, row: Any) -> None:
-        streams[name].write(canonical({'log_seq': counts[name], 'payload': row, 'sha256': digest(row)}) + '\n')
-        streams[name].flush()
+        # No per-line digest any more: commands are small, and tampering is caught
+        # by replaying the match and comparing every frame, which is stronger than
+        # a checksum the writer itself could recompute.
+        streams[name].write(canonical({'log_seq': counts[name], 'payload': row}) + '\n')
         counts[name] += 1
+        if counts[name] % 100 == 0:
+            streams[name].flush()
 
-    def checkpoint(state: dict[str, Any] | None = None) -> None:
-        if state is None:
-            state = engine.public_state()
-        append_log('snapshots', {'seq': engine.seq, 'sim_time_ms': engine.sim_time_ms, 'hash': digest(state), 'state': state})
+    def checkpoint(state: dict[str, Any]) -> None:
+        frames.append(state)
     try:
         failures = {}
         for team, path in [('red', red_path), ('blue', blue_path)]:
@@ -273,12 +299,14 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
                     diagnostics.append({'team': team, 'phase': 'startup', **future.result()})
                 except PolicyFailure as exc:
                     failures[team] = str(exc)
-            checkpoint()
+            snapshot = initial_state
+            checkpoint(snapshot)
             if failures:
                 append_log('commands', {'seq': engine.seq, 'failures': failures, 'decisions': {'red': None, 'blue': None}})
                 engine.fail_policies(failures)
-                checkpoint()
-            observations = engine.observations()
+                snapshot = engine.public_state()
+                checkpoint(snapshot)
+            observations = engine.observations(snapshot)
             while not engine.done:
                 futures = {t: pool.submit(p.call, {'type': 'step', 'seq': engine.seq, 'observation': observations[t]}) for t, p in policies.items()}
                 decisions = {'red': None, 'blue': None}
@@ -307,10 +335,10 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
                 }
                 if failures:
                     engine.fail_policies(failures)
-                    next_public = engine.public_state()
+                    snapshot = engine.public_state()
                 else:
-                    next_public = engine.step(decisions, observations)
-                next_observations = engine.observations(next_public)
+                    snapshot = engine.step(decisions, observations)
+                next_observations = engine.observations(snapshot)
                 frame_record['receipts'] = {
                     team: next_observations[team]['receipts']
                     for team in ('red', 'blue')
@@ -318,31 +346,36 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
                 metrics.interval(observations, engine.sim_time_ms - frame_record['sim_time_ms'])
                 metrics.receipts(frame_record['receipts'])
                 append_log('commands', frame_record)
-                checkpoint(next_public)
+                checkpoint(snapshot)
                 observations = next_observations
+        final_hash = digest(frame_state(snapshot))
+        frames.close(final_hash)
         result = engine.result()
-        result.update({'match_id': match_id, 'output_dir': str(output), 'final_hash': digest(engine.public_state())})
+        result.update({'match_id': match_id, 'output_dir': str(output), 'final_hash': final_hash})
         result['metrics'] = metrics.finish(engine.events, result['faults'])
         write_json(output / 'result.json', result)
         write_json(output / 'score_ledger.json', result.get('score_ledger', []))
         for name, rows in [('events', engine.events), ('diagnostics', diagnostics)]:
             with (output / (name + '.jsonl')).open('w', encoding='utf-8') as stream:
                 for index, row in enumerate(rows):
-                    stream.write(canonical({'log_seq': index, 'payload': row, 'sha256': digest(row)}) + '\n')
+                    stream.write(canonical({'log_seq': index, 'payload': row}) + '\n')
         for stream in streams.values():
             stream.close()
-        hashes = {
-            path.name: file_hash(path)
-            for path in output.iterdir()
-            if path.is_file() and path.name != 'integrity.json'
-        }
-        write_json(output / 'integrity.json', hashes)
+        files = {}
+        for path in sorted(output.iterdir()):
+            if not path.is_file() or path.name == 'integrity.json':
+                continue
+            size, crc = file_crc32(path)
+            files[path.name] = {'size': size, 'crc32': f'{crc:08x}'}
+        write_json(output / 'integrity.json', {'format': BUNDLE_FORMAT, 'final_hash': final_hash, 'files': files})
         return result
     except BaseException as exc:
+        frames.abort()
         write_json(output / 'platform_failure.json', {'error': repr(exc), 'phase': 'platform', 'match_id': match_id})
         raise
     finally:
         for stream in streams.values():
             stream.close()
+        frames.abort()
         for policy in policies.values():
             policy.close()

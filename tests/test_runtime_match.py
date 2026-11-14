@@ -13,8 +13,21 @@ class MatchRuntimeTests(unittest.TestCase):
         result=run_match('examples/stack_builder.py','examples/adaptive_raider.py',{'duration_ms':22000},self.root/'match')
         self.assertEqual(result['status'],'completed');self.assertTrue(verify_replay(self.root/'match')['verified'])
         frames=read_log(self.root/'match'/'commands.jsonl');self.assertTrue(any(f['decisions']['red'] is not None for f in frames))
-        with (self.root/'match'/'commands.jsonl').open('a',encoding='utf-8') as stream:stream.write('{}\n')
+        snapshots=self.root/'match'/'snapshots.rcf'
+        self.assertTrue(snapshots.is_file())
+        self.assertLess(snapshots.stat().st_size,2*1024*1024)
+        with snapshots.open('ab') as stream:stream.write(b'\x00')
         with self.assertRaisesRegex(ValueError,'integrity'):verify_replay(self.root/'match')
+    def test_frame_checksums_detect_corruption(self):
+        from robocon_sim.frame_codec import FrameFormatError,FrameReader
+        run_match('examples/stack_builder.py','examples/stack_builder.py',{'duration_ms':2200},self.root/'match')
+        path=self.root/'match'/'snapshots.rcf'
+        reader=FrameReader(path);meta=reader.meta();self.assertGreater(len(meta),1)
+        target=meta[1]['frame']
+        offset=reader._entries[target][0]+reader._entries[target][1]-1
+        raw=bytearray(path.read_bytes());raw[offset]^=0xFF;path.write_bytes(bytes(raw))
+        with self.assertRaises(FrameFormatError):FrameReader(path).verify()
+        with self.assertRaises(ValueError):verify_replay(self.root/'match')
     def test_three_returned_errors_both_technical_draw(self):
         policy=self.policy('error','raise ValueError("bad decision")')
         result=run_match(policy,policy,{'duration_ms':1000},self.root/'match')

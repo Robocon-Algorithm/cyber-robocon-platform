@@ -116,6 +116,11 @@ def canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
+def _dump(value: Any) -> str:
+    """Compact JSON that keeps insertion order (used for the static block)."""
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
 # ---------------------------------------------------------------------------
 # value encoding
 
@@ -164,9 +169,12 @@ class _Encoder:
         elif isinstance(value, dict):
             buf.append(TAG_DICT)
             _write_varint(buf, len(value))
-            for key in sorted(value):
+            # Insertion order is preserved on purpose: the scoring ledger is
+            # built by iterating these maps, so re-ordering keys here would make a
+            # replayed match produce a differently ordered ledger.
+            for key, item in value.items():
                 self.string(buf, key)
-                self.value(buf, value[key])
+                self.value(buf, item)
         elif isinstance(value, (list, tuple)):
             buf.append(TAG_LIST)
             _write_varint(buf, len(value))
@@ -410,7 +418,10 @@ def apply_delta(payload: bytes, state: dict[str, Any], strings: list[str]) -> li
 
 
 def _prepare_static(static: dict[str, Any]) -> dict[str, Any]:
-    detached = json.loads(canonical(static))
+    # Deliberately not sort_keys: the map's insertion order drives the order in
+    # which towers are iterated, and therefore the order of the scoring ledger.
+    # Sorting here silently changed the ledger order of every replayed match.
+    detached = json.loads(_dump(static))
     published = detached.get("map")
     if isinstance(published, dict) and "workpoints" in published:
         if published.get("workpoints") == published.get("points"):
@@ -442,7 +453,7 @@ class FrameWriter:
         self._keyframes: list[int] = []
         self._closed = False
         self._static = _prepare_static(static)
-        self._static_bytes = zlib.compress(canonical(self._static).encode("utf-8"), 6)
+        self._static_bytes = zlib.compress(_dump(self._static).encode("utf-8"), 6)
         self._stream_offset = HEADER_SIZE + len(self._static_bytes)
         self._fp = self.path.open("w+b")
         # A valid but unfinalised header, so a crashed writer is distinguishable
