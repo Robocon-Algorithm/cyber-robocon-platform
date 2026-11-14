@@ -88,16 +88,34 @@ class StorageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.storage.upload(team['id'], name, code)
 
-    def test_official_version_is_unique_per_team(self):
+    def test_a_team_keeps_every_official_entry_and_plays_the_newest(self):
         team = self.versions['A_team']
         second = self.storage.upload(team, 'second.py', CODE + b'# two\n')
         self.storage.promote(self.versions['A'])
         self.storage.promote(second['id'])
-        official = [v for v in self.storage.versions(team) if v['kind'] == 'official']
-        self.assertEqual([v['id'] for v in official], [second['id']])
+        official = [v['id'] for v in self.storage.versions(team) if v['kind'] == 'official']
+        self.assertEqual(sorted(official), sorted([self.versions['A'], second['id']]))
+        self.assertEqual(self.storage.official_version(team), second['id'])
         ranked = {t['name']: t for t in self.storage.ranking()}
         self.assertEqual(ranked['A']['official_version'], second['id'])
         self.assertIsNone(ranked['B']['official_version'])
+
+    def test_official_is_one_way(self):
+        team = self.versions['A_team']
+        self.storage.promote(self.versions['A'])
+        self.assertFalse(hasattr(self.storage, 'retract'))
+        self.assertEqual([v['kind'] for v in self.storage.versions(team)], ['official'])
+        self.storage.promote(self.versions['A'])
+        self.assertEqual([v['kind'] for v in self.storage.versions(team)], ['official'])
+
+    def test_batch_delta_is_signed_for_the_viewer(self):
+        series_id = self.storage.create_series(self.versions['A'], self.versions['B'], 2, ranked=True)
+        batch = self.storage.claim_batch()
+        self.storage.finish_series(batch['id'], batch['lease'], series_id,
+                                   [{'winner': 'red'}, {'winner': 'blue'}])
+        self.storage.finish_batch(batch['id'], batch['lease'], 'COMPLETED', {})
+        self.assertEqual(self.storage.batches(team_id=self.versions['A_team'])[0]['elo_delta'], 12.0)
+        self.assertEqual(self.storage.batches(team_id=self.versions['B_team'])[0]['elo_delta'], -12.0)
 
     def test_ranking_reads_the_profile_pool_that_settled(self):
         # Regression: the table joined a fixed legacy pool name while settlements
@@ -126,15 +144,6 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(len(row['series'][0]['result']), 2)
         self.assertEqual(row['progress'], {'total': 1, 'done': 1, 'failed': 0})
         self.assertEqual(row['elo_delta'], 12.0)
-
-    def test_retract_returns_the_entry_to_draft(self):
-        team = self.versions['A_team']
-        self.storage.promote(self.versions['A'])
-        self.assertEqual([v['kind'] for v in self.storage.versions(team)], ['official'])
-        result = self.storage.retract(self.versions['A'])
-        self.assertEqual(result['kind'], 'draft')
-        self.assertEqual([v['kind'] for v in self.storage.versions(team)], ['draft'])
-        self.assertIsNone({t['name']: t for t in self.storage.ranking()}['A']['official_version'])
 
     def test_unversioned_database_is_rejected(self):
         root = Path(self.temp.name) / 'old'

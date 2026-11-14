@@ -182,10 +182,15 @@ function renderTeam() {
   panel.append(element('p', `胜 ${team.wins || 0} · 平 ${team.draws || 0} · 负 ${team.losses || 0} · 共 ${team.pairs || 0} 组`, 'hint'));
 }
 
+function currentEntry() {
+  const team = (state.teams || []).find(item => item.id === state.user.team_id);
+  return team ? team.official_version : null;
+}
+
 function renderStrategies() {
   const list = state.strategies || [];
   const mine = state.user.team_id;
-  const signature = list.map(v => `${v.id}:${v.kind}`).join(',');
+  const signature = list.map(v => `${v.id}:${v.kind}:${v.id === currentEntry()}`).join(',');
   const container = $('strategies');
   container.classList.toggle('empty', list.length === 0);
   if (signatures.strategies !== signature) {
@@ -198,6 +203,9 @@ function renderStrategies() {
       title.append(element('b', version.filename));
       title.append(element('span', version.kind === 'official' ? '正式' : '草稿',
         'badge ' + (version.kind === 'official' ? 'official' : 'draft')));
+      if (version.kind === 'official' && version.id === currentEntry()) {
+        title.append(element('span', '当前出战', 'badge current'));
+      }
       const owner = state.is_admin && version.team_id !== mine ? ` · ${version.team_name || '他队'}` : '';
       const meta = element('small', `${String(version.sha256).slice(0, 8)} · ${stamp(version.created)}${owner}`);
       const actions = element('div', undefined, 'strategy-actions');
@@ -205,18 +213,11 @@ function renderStrategies() {
       download.type = 'button';
       download.onclick = () => downloadStrategy(version);
       actions.append(download);
-      if (version.team_id === mine) {
-        if (version.kind === 'official') {
-          const retract = element('button', '撤销正式', 'chip-button');
-          retract.type = 'button';
-          retract.onclick = () => retractOfficial(version);
-          actions.append(retract);
-        } else {
-          const promote = element('button', '设为正式', 'chip-button primary');
-          promote.type = 'button';
-          promote.onclick = () => submitOfficial(version);
-          actions.append(promote);
-        }
+      if (version.team_id === mine && version.kind !== 'official') {
+        const promote = element('button', '设为正式', 'chip-button primary');
+        promote.type = 'button';
+        promote.onclick = () => submitOfficial(version);
+        actions.append(promote);
       }
       row.append(title, meta, actions);
       container.append(row);
@@ -312,9 +313,9 @@ function renderBatches() {
     head.append(element('span', STATUS[batch.status] || batch.status, 'badge ' + batch.status));
     head.append(element('small', `${stamp(batch.created)} · ${batch.progress.done || 0}/${batch.progress.total || 0} 组`));
     const delta = Number(batch.elo_delta || 0);
-    if (batch.kind === 'official' && delta) {
+    if (batch.kind === 'official') {
       head.append(element('small', (delta > 0 ? '+' : '') + delta.toFixed(1) + ' Elo',
-        delta > 0 ? 'elo-up' : 'elo-down'));
+        delta > 0 ? 'elo-up' : (delta < 0 ? 'elo-down' : 'elo-flat')));
     }
     if (batch.team_id === state.user.team_id) head.append(element('small', '由本队发起'));
     block.append(head);
@@ -325,6 +326,12 @@ function renderBatches() {
     block.append(seriesList);
     container.append(block);
   }
+}
+
+function batchStatusHint(series) {
+  if (series.status === 'RUNNING') return '正在打';
+  if (series.status === 'VOID') return '已作废';
+  return '等待中';
 }
 
 function seriesRow(series) {
@@ -345,12 +352,16 @@ function seriesRow(series) {
   row.append(label);
   row.append(element('small', STATUS[series.status] || series.status, 'series-status'));
   if (result.length) {
+    row.classList.add('openable');
+    row.onclick = () => openReplay(series.id, 0);
     result.forEach((game, index) => {
       const open = element('button', result.length > 1 ? `第 ${index + 1} 局` : '回放', 'chip-button');
       open.type = 'button';
-      open.onclick = () => openReplay(series.id, index);
+      open.onclick = event => { event.stopPropagation(); openReplay(series.id, index); };
       row.append(open);
     });
+  } else {
+    row.append(element('small', batchStatusHint(series), 'series-status'));
   }
   return row;
 }
@@ -473,19 +484,6 @@ async function submitOfficial(version) {
     notice(reply.waiting
       ? '已设为正式策略，等待其他队伍提交后可交手'
       : `正式循环赛已排队：${reply.series} 组换边双局`);
-    await refresh();
-  } catch (error) {
-    notice(error.message);
-  }
-}
-
-async function retractOfficial(version) {
-  try {
-    const reply = await api('/api/strategies/' + version.id + '/retract', {}, 'POST');
-    notice(reply.pending_series
-      ? `已撤销为草稿；仍有 ${reply.pending_series} 组已排队的正式对局会照常结算`
-      : '已撤销为草稿，不再进入正式循环赛');
-    signatures.strategies = '';
     await refresh();
   } catch (error) {
     notice(error.message);

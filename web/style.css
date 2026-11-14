@@ -115,3 +115,7 @@
 .elo-down{color:var(--blue)}
 
 [hidden]{display:none !important}
+.badge.current{color:var(--blue);border-color:var(--blue)}
+.series-row.openable{cursor:pointer;padding:2px 0}
+.series-row.openable:hover{background:rgba(220,233,118,.35)}
+.elo-flat{color:var(--muted)}

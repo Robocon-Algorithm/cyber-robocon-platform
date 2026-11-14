@@ -15,7 +15,7 @@ from .report import series_summary
 
 MAX_UPLOAD = 256 * 1024
 INITIAL_ELO = 1000
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 BATCH_KINDS = ('manual', 'auto_round', 'all_play', 'official')
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
@@ -29,7 +29,6 @@ CREATE TABLE IF NOT EXISTS versions(
     id TEXT PRIMARY KEY, team_id TEXT NOT NULL, sha256 TEXT NOT NULL, path TEXT NOT NULL,
     filename TEXT NOT NULL, created REAL NOT NULL, kind TEXT NOT NULL DEFAULT 'draft',
     uploaded_by TEXT, retired REAL);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_one_official ON versions(team_id) WHERE kind='official';
 CREATE TABLE IF NOT EXISTS batches(
     id TEXT PRIMARY KEY, kind TEXT NOT NULL, team_id TEXT NOT NULL, requested_by TEXT,
     status TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0, lease TEXT,
@@ -58,7 +57,7 @@ CREATE INDEX IF NOT EXISTS idx_versions_team ON versions(team_id, created DESC);
 """
 _TEAM_WITH_CURRENT_ELO = """
     SELECT t.id, t.name, COALESCE(r.elo, ?) AS elo,
-           (SELECT id FROM versions v WHERE v.team_id=t.id AND v.kind='official') AS official_version
+           (SELECT id FROM versions v WHERE v.team_id=t.id AND v.kind='official' ORDER BY v.created DESC, v.rowid DESC LIMIT 1) AS official_version
     FROM teams AS t
     LEFT JOIN team_ratings AS r ON t.id=r.team_id AND r.timing_profile=?
 """
@@ -108,6 +107,12 @@ class Storage:
             if version == 0:
                 db.executescript(SCHEMA)
                 db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
+                db.commit()
+            elif version == 3:
+                # A team may hold several official entries: being official is a
+                # one-way certification, not a single lineup slot.
+                db.execute('DROP INDEX IF EXISTS idx_one_official')
+                db.execute('PRAGMA user_version=4')
                 db.commit()
 
     def _recover(self) -> None:
@@ -287,41 +292,27 @@ class Storage:
         return row['filename'], path.read_bytes(), dict(row)
 
     def promote(self, version_id: str) -> dict[str, Any]:
-        """Mark one version as its team's official entry, retiring the previous one."""
-        with self.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            row = db.execute('SELECT * FROM versions WHERE id=?', (version_id,)).fetchone()
-            if row is None:
-                raise ValueError('unknown strategy version')
-            if row['kind'] == 'official':
-                return dict(row)
-            db.execute("UPDATE versions SET kind='draft', retired=? WHERE team_id=? AND kind='official'",
-                       (time.time(), row['team_id']))
-            db.execute("UPDATE versions SET kind='official', retired=NULL WHERE id=?", (version_id,))
-            return dict(db.execute('SELECT * FROM versions WHERE id=?', (version_id,)).fetchone())
+        """Certify a version as official. One-way: official entries never revert.
 
-    def retract(self, version_id: str) -> dict[str, Any]:
-        """Take an entry out of official play without deleting its history.
-
-        Already-queued series keep running: they were scheduled against this entry
-        before the retraction, and cancelling them would void another team's work.
-        The count is returned so the caller can say so out loud.
+        A team may hold many official versions over its lifetime; the newest one is
+        the entry that future round robins are scheduled against.
         """
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM versions WHERE id=?', (version_id,)).fetchone()
             if row is None:
                 raise ValueError('unknown strategy version')
-            pending = db.execute(
-                "SELECT COUNT(*) FROM series s JOIN batches b ON b.id=s.batch_id "
-                "WHERE b.status IN ('QUEUED','RUNNING') AND (s.a_version=? OR s.b_version=?)",
-                (version_id, version_id)).fetchone()[0]
-            if row['kind'] == 'official':
-                db.execute("UPDATE versions SET kind='draft', retired=? WHERE id=?",
-                           (time.time(), version_id))
-            data = dict(db.execute('SELECT * FROM versions WHERE id=?', (version_id,)).fetchone())
-            data['pending_series'] = pending
-            return data
+            if row['kind'] != 'official':
+                db.execute("UPDATE versions SET kind='official', retired=NULL WHERE id=?", (version_id,))
+            return dict(db.execute('SELECT * FROM versions WHERE id=?', (version_id,)).fetchone())
+
+    def official_version(self, team_id: str) -> str | None:
+        """The team's current entry: the most recently certified official version."""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT id FROM versions WHERE team_id=? AND kind='official' "
+                "ORDER BY created DESC, rowid DESC LIMIT 1", (team_id,)).fetchone()
+        return row['id'] if row else None
 
     # -- batches -----------------------------------------------------------
 
@@ -513,13 +504,6 @@ class Storage:
             db.execute('DELETE FROM occupancy WHERE batch_id=?', (batch_id,))
             return True
 
-    def _elo_delta(self, db: ManagedConnection, batch_id: str, team_id: str) -> float:
-        """Signed Elo change for one team across a batch (positive = gained)."""
-        rows = db.execute(
-            'SELECT x.a AS a, s.delta AS delta FROM settlements s '
-            'JOIN series x ON x.id=s.series_id WHERE x.batch_id=?', (batch_id,)).fetchall()
-        return round(sum(row['delta'] if row['a'] == team_id else -row['delta'] for row in rows), 4)
-
     def batch(self, batch_id: str) -> dict[str, Any]:
         with self.connect() as db:
             row = db.execute('SELECT * FROM batches WHERE id=?', (batch_id,)).fetchone()
@@ -529,10 +513,13 @@ class Storage:
             for field in ('config', 'result'):
                 if data.get(field):
                     data[field] = json.loads(data[field])
-            data['series'] = [self._series(db, r) for r in
-                              db.execute('SELECT * FROM series WHERE batch_id=? ORDER BY position',
-                                         (batch_id,))]
-            data['elo_delta'] = self._elo_delta(db, batch_id, data['team_id'])
+            rows = [self._series(db, r) for r in
+                    db.execute('SELECT * FROM series WHERE batch_id=? ORDER BY position', (batch_id,))]
+            data['series'] = rows
+            settled = {row['series_id']: row['delta'] for row in db.execute(
+                'SELECT series_id, SUM(delta) AS delta FROM settlements WHERE series_id IN '
+                '(SELECT id FROM series WHERE batch_id=?) GROUP BY series_id', (batch_id,))}
+            data['elo_delta'] = self._delta_for([dict(r) for r in rows], settled, data['team_id'])
             return data
 
     def _series_brief(self, row: Any) -> dict[str, Any]:
@@ -544,7 +531,8 @@ class Storage:
                 ('id', 'batch_id', 'position', 'a', 'b', 'count', 'status', 'ranked',
                  'result', 'red_profile', 'blue_profile')}
 
-    def batches(self, limit: int = 50) -> list[dict[str, Any]]:
+    def batches(self, limit: int = 50, team_id: str | None = None) -> list[dict[str, Any]]:
+        """Recent batches. `elo_delta` is signed for `team_id` (the viewer)."""
         with self.connect() as db:
             rows = db.execute('SELECT * FROM batches ORDER BY created DESC LIMIT ?', (limit,)).fetchall()
             if not rows:
@@ -555,12 +543,9 @@ class Storage:
             for row in db.execute(
                     f'SELECT * FROM series WHERE batch_id IN ({marks}) ORDER BY position', ids):
                 series.setdefault(row['batch_id'], []).append(self._series_brief(row))
-            deltas = {row['bid']: row['delta'] for row in db.execute(
-                'SELECT x.batch_id AS bid, '
-                'SUM(CASE WHEN x.a=b.team_id THEN s.delta ELSE -s.delta END) AS delta '
-                'FROM settlements s JOIN series x ON x.id=s.series_id '
-                'JOIN batches b ON b.id=x.batch_id '
-                f'WHERE x.batch_id IN ({marks}) GROUP BY x.batch_id', ids)}
+            settled = {row['series_id']: row['delta'] for row in db.execute(
+                f'SELECT series_id, SUM(delta) AS delta FROM settlements WHERE series_id IN '
+                f'(SELECT id FROM series WHERE batch_id IN ({marks})) GROUP BY series_id', ids)}
             out = []
             for row in rows:
                 data = dict(row)
@@ -574,9 +559,24 @@ class Storage:
                     'done': sum(1 for s in rows_series if s['status'] == 'COMPLETED'),
                     'failed': sum(1 for s in rows_series if s['status'] == 'VOID'),
                 }
-                data['elo_delta'] = round(deltas.get(row['id'], 0.0), 4)
+                data['elo_delta'] = self._delta_for(rows_series, settled,
+                                                    team_id or row['team_id'])
                 out.append(data)
             return out
+
+    @staticmethod
+    def _delta_for(rows_series: list[dict[str, Any]], settled: dict[str, float],
+                   team_id: str | None) -> float:
+        total = 0.0
+        for series in rows_series:
+            change = settled.get(series['id'])
+            if not change:
+                continue
+            if series['a'] == team_id:
+                total += change
+            elif series['b'] == team_id:
+                total -= change
+        return round(total, 4)
 
     # -- ratings -----------------------------------------------------------
 

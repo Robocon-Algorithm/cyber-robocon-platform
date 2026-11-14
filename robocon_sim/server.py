@@ -149,11 +149,17 @@ class Application:
     def state(self, user: dict[str, Any]) -> dict[str, Any]:
         admin = user.get('role') == 'admin'
         platform = self.config.current()
+        batches = self.storage.batches(60 if admin else 30, user.get('team_id'))
+        if not admin:
+            team = user.get('team_id')
+            batches = [b for b in batches
+                       if b['team_id'] == team
+                       or any(s['a'] == team or s['b'] == team for s in b['series'])]
         payload: dict[str, Any] = {
             'user': user,
             'is_admin': admin,
             'teams': self.storage.ranking(),
-            'batches': self.storage.batches(60 if admin else 30),
+            'batches': batches,
             'strategies': self.storage.versions(None if admin else user.get('team_id')),
             'platform': {
                 'schema': SCHEMA_VERSION,
@@ -475,12 +481,6 @@ def handler_for(app: Application):
                 if route.startswith('/api/strategies/') and route.endswith('/official'):
                     self.respond(200, app.submit_official(user, route.split('/')[3], payload))
                     return
-                if route.startswith('/api/strategies/') and route.endswith('/retract'):
-                    if not user.get('team_id'):
-                        raise ApiError(403, 'this account has no team; ask an administrator')
-                    row = app._version_row(user['team_id'], route.split('/')[3])
-                    self.respond(200, app.storage.retract(row['id']))
-                    return
                 if route == '/api/password':
                     self.storage.change_password(user['id'], payload.get('current', ''),
                                                  payload.get('password', ''))
@@ -515,6 +515,7 @@ def handler_for(app: Application):
             self.send_header('Content-Type', f'{kind}; charset=utf-8' if kind.startswith('text/') else kind)
             self.send_header('Content-Length', str(len(body)))
             self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Cache-Control', 'no-store, must-revalidate')
             self.end_headers()
             self.wfile.write(body)
 
