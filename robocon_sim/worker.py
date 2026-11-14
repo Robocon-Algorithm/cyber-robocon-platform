@@ -37,6 +37,7 @@ def main() -> None:
     sys.stdout = diagnostic
     sys.stderr = diagnostic
     instance = None
+    frozen_map = {}
     for raw in sys.stdin.buffer:
         started = time.process_time_ns()
         try:
@@ -44,7 +45,7 @@ def main() -> None:
                 raise ValueError('request too large')
             request = json.loads(raw)
             if request['type'] == 'start':
-                from brsdk import Strategy, Observation, StrategyAPI
+                from brsdk import Strategy, Observation, StrategyAPI, _freeze
                 spec = importlib.util.spec_from_file_location('submitted_strategy', request['path'])
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
@@ -53,9 +54,22 @@ def main() -> None:
                     raise ValueError('exactly one Strategy subclass required')
                 instance = classes[0]()
                 instance.on_start(Observation(request['context']))
+                # Freeze the geometry once; every step request omits it and the
+                # worker injects this same read-only view back into the envelope.
+                frozen_map = _freeze(request['context'].get('map') or {})
+                frozen_team = str(request['context'].get('team') or 'red')
                 decision = None
             else:
-                obs = Observation(request['observation'])
+                observation = request['observation']
+                observation['map'] = frozen_map
+                # The envelope ships `self` and `opponent` only; rebuild the map the
+                # kernel would have published instead of paying for it twice. A
+                # hand-built request without them keeps its own shape.
+                if 'self' in observation and 'opponent' in observation:
+                    other = 'blue' if frozen_team == 'red' else 'red'
+                    observation['robots'] = {frozen_team + '_br': observation['self'],
+                                             other + '_br': observation['opponent']}
+                obs = Observation(observation)
                 api = StrategyAPI(obs)
                 decision = instance.on_step(obs, api)
                 if decision is not None and hasattr(decision, 'to_dict'):

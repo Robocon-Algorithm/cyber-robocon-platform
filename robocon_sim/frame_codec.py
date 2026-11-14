@@ -299,13 +299,17 @@ def _same(left: Any, right: Any) -> bool:
 def _diff(previous: Any, current: Any, path: tuple[Any, ...],
           sets: list[tuple[tuple[Any, ...], Any]], dels: list[tuple[Any, ...]]) -> None:
     if isinstance(previous, dict) and isinstance(current, dict):
-        previous_keys, current_keys = set(previous), set(current)
-        for key in sorted(previous_keys - current_keys):
-            dels.append(path + (key,))
-        for key in sorted(current_keys - previous_keys):
-            sets.append((path + (key,), current[key]))
-        for key in sorted(current_keys & previous_keys):
-            _diff(previous[key], current[key], path + (key,), sets, dels)
+        # One sorted pass over the live mapping instead of building two key sets
+        # for every nested dict: this runs ~1800 times per match over ~1000 leaves.
+        for key in sorted(current):
+            if key in previous:
+                _diff(previous[key], current[key], path + (key,), sets, dels)
+            else:
+                sets.append((path + (key,), current[key]))
+        if len(previous) != len(current):
+            for key in sorted(previous):
+                if key not in current:
+                    dels.append(path + (key,))
         return
     if _same(previous, current):
         return

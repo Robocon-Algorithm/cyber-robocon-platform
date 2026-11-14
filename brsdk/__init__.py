@@ -10,10 +10,19 @@ from typing import Any
 from robocon_sim.planning import quote_action
 
 SDK_VERSION = "0.1.0"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 def _freeze(value: Any) -> Any:
+    # Already-frozen values are reused instead of rebuilt. The map is frozen once
+    # at startup and injected into every step by the worker, so this is the fast
+    # path that keeps 21 KB of geometry out of the per-frame cost.
+    if value is None or isinstance(value, (bool, int, float, str)):
+        # Immutable scalars need no copy; deepcopy per leaf was measurable on a
+        # payload with ~1000 leaves.
+        return value
+    if isinstance(value, (ReadOnlyView, tuple)):
+        return value
     if isinstance(value, dict):
         return ReadOnlyView(value)
     if isinstance(value, (list, tuple)):

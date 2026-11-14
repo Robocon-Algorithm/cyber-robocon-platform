@@ -38,6 +38,14 @@ BUDGETS = {
 def canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
 
+def wire(value: Any) -> str:
+    """Protocol encoding: same compact form, but no key sorting.
+
+    Sorting every nested mapping cost more than the transfer itself and bought
+    nothing: the payload is parsed straight back into a dict, never hashed.
+    """
+    return json.dumps(value, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
+
 def digest(value: Any) -> str:
     return hashlib.sha256(canonical(value).encode()).hexdigest()
 
@@ -95,7 +103,25 @@ class PolicyProcess:
         self.responses = queue.Queue(maxsize=2)
         self.errors = 0
         self.closed = False
+        self._outbox: queue.SimpleQueue = queue.SimpleQueue()
         threading.Thread(target=self._reader, daemon=True).start()
+        # One long-lived writer per policy. Spawning a thread per call cost a spawn
+        # plus a GIL hand-off on every tick, which showed up as latency rather than
+        # throughput once the payload was already small.
+        self._writer = threading.Thread(target=self._write_loop, daemon=True)
+        self._writer.start()
+
+    def _write_loop(self) -> None:
+        while True:
+            chunk = self._outbox.get()
+            if chunk is None:
+                return
+            try:
+                self.process.stdin.write(chunk)
+                self.process.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                self._deliver(PolicyFailure('policy exited'))
+                return
 
     def _deliver(self, response: Any) -> None:
         try:
@@ -159,20 +185,14 @@ class PolicyProcess:
     def call(self, message: dict[str, Any], startup: bool=False) -> dict[str, Any]:
         if self.closed:
             raise PolicyFailure('policy terminated')
-        encoded = (canonical(message) + '\n').encode()
+        encoded = (wire(message) + '\n').encode()
         if len(encoded) > MAX_MESSAGE:
             raise RuntimeError('platform snapshot exceeds protocol limit')
         before = self._cpu()
         start = time.monotonic()
         deadline = start + (self.startup_ms if startup else self.wall_ms) / 1000
 
-        def send():
-            try:
-                self.process.stdin.write(encoded)
-                self.process.stdin.flush()
-            except (BrokenPipeError, OSError, ValueError):
-                self._deliver(PolicyFailure('policy exited'))
-        threading.Thread(target=send, daemon=True).start()
+        self._outbox.put(encoded)
         while True:
             elapsed = time.monotonic() - start
             if time.monotonic() > deadline:
@@ -212,6 +232,7 @@ class PolicyProcess:
     def close(self) -> None:
         if not self.closed:
             self.closed = True
+            self._outbox.put(None)
             if self.process.poll() is None:
                 self.process.kill()
             self.process.wait(timeout=3)
@@ -321,7 +342,13 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
                 checkpoint(snapshot)
             observations = engine.observations(snapshot)
             while not engine.done:
-                futures = {t: pool.submit(p.call, {'type': 'step', 'seq': engine.seq, 'observation': observations[t]}) for t, p in policies.items()}
+                # The map never changes and the worker already holds a frozen copy
+                # from on_start; `robots` duplicates `self`/`opponent` verbatim.
+                # Both are rebuilt in the worker, which kept 21 KB + 5 KB per side
+                # per tick off the wire.
+                payloads = {t: {k: v for k, v in observations[t].items() if k not in ('map', 'robots')}
+                            for t in ('red', 'blue')}
+                futures = {t: pool.submit(p.call, {'type': 'step', 'seq': engine.seq, 'observation': payloads[t]}) for t, p in policies.items()}
                 decisions = {'red': None, 'blue': None}
                 failures = {}
                 responses = {}

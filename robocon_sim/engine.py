@@ -22,6 +22,11 @@ _SHARED_KEYS = ("map", "parameters")
 
 
 def _public(value: Any) -> Any:
+    # Scalars are immutable, so they can be published as-is. Calling deepcopy on
+    # every leaf was the single largest cost of building a frame snapshot: the
+    # world has ~1000 leaves and deepcopy dispatches on each of them.
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
     if isinstance(value, dict):
         return {k: _public(v) for k, v in value.items() if not k.startswith("_")}
     if isinstance(value, list):
