@@ -111,3 +111,5 @@
 .panel-hint{padding:0 18px 12px}
 .ranking-info{display:grid;gap:2px}
 .ranking-info small{font-size:10px}
+.elo-up{color:#437442}
+.elo-down{color:var(--blue)}

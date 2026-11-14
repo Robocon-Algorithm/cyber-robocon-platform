@@ -27,6 +27,15 @@
       </section>
 
       <section class="panel">
+        <div class="section-title"><span>修改密码</span><small>自助</small></div>
+        <form id="password-form">
+          <label>当前密码<input id="current-password" type="password" autocomplete="current-password" required></label>
+          <label>新密码<input id="own-password" type="password" minlength="8" autocomplete="new-password" required></label>
+          <button type="submit">保存新密码 <span>✓</span></button>
+        </form>
+      </section>
+
+      <section class="panel">
         <div class="section-title"><span>02 / 策略库</span><small>UTF-8 · .PY</small></div>
         <form id="upload-form">
           <label class="file-zone">上传新版本<input id="file" type="file" accept=".py" required><small>继承 Strategy，提供 on_step(obs, api)</small></label>

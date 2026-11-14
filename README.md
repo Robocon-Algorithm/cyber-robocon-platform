@@ -2,19 +2,27 @@
 
 本版可直接运行两份 Python 策略，按同一个比赛时钟推进 BR，保存逐帧回放和逐件计分。默认 180 秒、每 100 ms 决策一次。请先跑通示例，再改一项策略选择，用同一场景的回放比较差别。规则、动作时间和地图假设以[上级方案](../README.md)与代码为准。
 
-> **不兼容旧版本**：快照为二进制增量格式（`.rcf`），数据库 schema 为 `user_version=2`。旧数据库会被拒绝加载，需要删掉数据目录重新开始。旧策略源码已归档到 [`examples/archive/`](examples/archive/INDEX.md)。
+> **不兼容旧版本**：快照为二进制增量格式（`.rcf`），数据库 schema 为 `user_version=3`。旧数据库会被拒绝加载，需要删掉数据目录重新开始。旧策略源码已归档到 [`examples/archive/`](examples/archive/INDEX.md)。
 
 ## 在 Windows 上开始第一局
 
 安装 Python 3.11 或以上版本；从本目录运行，不需要安装第三方运行依赖。
 
 ```powershell
-python -m robocon_sim demo --output runs/demo-first
-python -m robocon_sim replay runs/demo-first
 python -m robocon_sim serve --host 127.0.0.1 --port 8765 --trusted-code
 ```
 
-用浏览器打开 `http://127.0.0.1:8765`。用不同队名分别上传 [stack_builder.py](examples/stack_builder.py) 和 [adaptive_raider.py](examples/adaptive_raider.py)，选择两份版本与两方的参数档后创建单局或换边系列。队列显示已完成后，点击该局的比分打开回放。拖动时间轴或点击事件即可查看当时状态；最终得分从内核账本读取。
+首次启动会创建管理员并把密码打印一次在终端（也可以用 `--admin-password` 指定）。用浏览器打开 `http://127.0.0.1:8765`，以管理员登录后：
+
+1. **建队伍** —— 「管理员」面板里创建队伍，例如 `逐星算法组`。
+2. **建账号** —— 给每支队伍建一个或多个队员账号，初始密码至少 8 位。
+3. **队员登录后上传策略** —— 只能看到并下载本队自己的版本，草稿与正式分开标记。
+4. **打训练局** —— 手动对手单局/换边双局、自动跑一轮、对所有人，这些都不计分。
+5. **设为正式策略** —— 系统自动对当时所有其他队伍已提交的正式策略各打一组换边双局，结束后结算 Elo 并写入批次报告。
+
+之后新增的正式提交会继续和你的正式策略交手，不需要你重新发起。
+
+单局仍然是 180 秒、每 100 ms 决策一次。上传的版本冻结在磁盘上，队列里的批次取的是冻结版本，之后重新上传不会影响已排队的对局。
 
 每个版本只提交一份 UTF-8 `.py` 文件，最大 256 KiB，定义一个直接继承 `brsdk.Strategy` 的类，实现同步的 `on_step(self, obs, api)`。上传会检查语法和入口并生成源码摘要，执行前仍由操作者审查。
 
@@ -56,9 +64,22 @@ data/arena/
 
 5 m/s 是 127–203 mm 麦克纳姆轮配 400–600 rpm 减速电机的上限区间；转向与上下楼按「与行走并行完成的机构动作」压缩，不再串行占用整段时间。`config.py` 里的教学默认值保持不变。
 
+### 随机参数干扰
+
+`platform.json` 里的 `perturbation` 决定哪些批次给参数加抖动：
+
+```json
+"perturbation": {"enabled": true, "applies_to": ["official"], "speed_pct": 3, "accel_pct": 3, "time_pct": 2}
+```
+
+- 一组换边双局用**同一组**抖动，且双方参数相同——否则就变成「一方机器人更慢」的不公平对决，而不是鲁棒性测试。
+- 抖动种子由 `队伍 | 对手 | 批次类型 | nonce` 派生，倍率和最终参数写进 `series.matches`，批次配置里也留了记录，所以照样能复现。
+- `applies_to` 可选 `official / manual / auto_round / all_play`；默认只对正式赛开启，训练对照保持干净参数。
+
 ```powershell
+python -m robocon_sim demo --output runs/demo-first
+python -m robocon_sim replay runs/demo-first
 python -m robocon_sim match --red examples/stack_builder.py --blue examples/adaptive_raider.py --output runs/my-match --duration-ms 22000
-python -m robocon_sim match --red examples/stack_builder.py --blue examples/adaptive_raider.py --output runs/mixed --red-profile baseline --blue-profile training
 python -m robocon_sim series --red examples/stack_builder.py --blue examples/adaptive_raider.py --count 2 --output runs/my-pair
 python -m unittest discover -s tests -v
 ```
@@ -91,7 +112,7 @@ python -m robocon_sim dump runs/demo-first --frame 900     # 该帧完整状态�
 
 ## 当前验证和使用边界
 
-121 项自动测试通过。同一组 `stack_builder.py`（红）对 `adaptive_raider.py`（蓝）180 秒、赛级基线下比分 500 / 670，1800 帧重演通过。切换到 `training` 档可以复现 3 m/s 的旧节奏。
+132 项自动测试通过。同一组 `stack_builder.py`（红）对 `adaptive_raider.py`（蓝）180 秒、赛级基线下比分 500 / 670，1800 帧重演通过。切换到 `training` 档可以复现 3 m/s 的旧节奏。
 
 单局产物体积与耗时（本机实测，同一台机器）：
 

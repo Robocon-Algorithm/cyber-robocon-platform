@@ -472,6 +472,11 @@ def handler_for(app: Application):
                 if route.startswith('/api/strategies/') and route.endswith('/official'):
                     self.respond(200, app.submit_official(user, route.split('/')[3], payload))
                     return
+                if route == '/api/password':
+                    self.storage.change_password(user['id'], payload.get('current', ''),
+                                                 payload.get('password', ''))
+                    self.respond(200, {'ok': True, 'relogin': True})
+                    return
                 if route == '/api/admin/users':
                     self.respond(200, app.admin_create_user(self.token(), payload))
                     return

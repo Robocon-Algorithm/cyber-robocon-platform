@@ -303,6 +303,11 @@ function renderBatches() {
     head.append(element('span', KIND_NAMES[batch.kind] || batch.kind, 'badge kind-' + batch.kind));
     head.append(element('span', STATUS[batch.status] || batch.status, 'badge ' + batch.status));
     head.append(element('small', `${stamp(batch.created)} · ${batch.progress.done || 0}/${batch.progress.total || 0} 组`));
+    const delta = Number(batch.elo_delta || 0);
+    if (batch.kind === 'official' && delta) {
+      head.append(element('small', (delta > 0 ? '+' : '') + delta.toFixed(1) + ' Elo',
+        delta > 0 ? 'elo-up' : 'elo-down'));
+    }
     if (batch.team_id === state.user.team_id) head.append(element('small', '由本队发起'));
     block.append(head);
     const seriesList = element('div', 'series-list');
@@ -391,6 +396,19 @@ $('upload-form').onsubmit = async event => {
     notice(error.message);
   } finally {
     button.disabled = false;
+  }
+};
+
+$('password-form').onsubmit = async event => {
+  event.preventDefault();
+  try {
+    await api('/api/password', {current: $('current-password').value, password: $('own-password').value}, 'POST');
+    $('current-password').value = '';
+    $('own-password').value = '';
+    notice('密码已更新，请重新登录');
+    await logout();
+  } catch (error) {
+    notice(error.message);
   }
 };
 

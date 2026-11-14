@@ -139,6 +139,13 @@ class AccountTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.storage.create_user('bob', 'short', 'member', self.team['id'])
 
+    def test_self_service_password_change(self):
+        user = self.storage.create_user('alice', 'password123', 'member', self.team['id'])
+        with self.assertRaisesRegex(ValueError, 'current password'):
+            self.storage.change_password(user['id'], 'wrongpassword', 'password456')
+        self.storage.change_password(user['id'], 'password123', 'password456')
+        self.storage.login('alice', 'password456')
+
     def test_member_needs_a_team_and_reset_revokes_sessions(self):
         with self.assertRaisesRegex(ValueError, 'team'):
             self.storage.create_user('bob', 'password123', 'member', None)

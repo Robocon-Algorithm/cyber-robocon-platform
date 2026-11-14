@@ -183,6 +183,14 @@ class Storage:
                 raise ValueError('unknown user')
             db.execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
 
+    def change_password(self, user_id: str, current: str, password: str) -> None:
+        """Self-service change: the current password still has to be proven."""
+        with self.connect() as db:
+            row = db.execute('SELECT salt, password_hash FROM users WHERE id=?', (user_id,)).fetchone()
+        if row is None or not verify_password(current, row['salt'], row['password_hash']):
+            raise ValueError('current password is incorrect')
+        self.set_password(user_id, password)
+
     def users(self) -> list[dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
@@ -480,6 +488,13 @@ class Storage:
             db.execute('DELETE FROM occupancy WHERE batch_id=?', (batch_id,))
             return True
 
+    def _elo_delta(self, db: ManagedConnection, batch_id: str, team_id: str) -> float:
+        """Signed Elo change for one team across a batch (positive = gained)."""
+        rows = db.execute(
+            'SELECT x.a AS a, s.delta AS delta FROM settlements s '
+            'JOIN series x ON x.id=s.series_id WHERE x.batch_id=?', (batch_id,)).fetchall()
+        return round(sum(row['delta'] if row['a'] == team_id else -row['delta'] for row in rows), 4)
+
     def batch(self, batch_id: str) -> dict[str, Any]:
         with self.connect() as db:
             row = db.execute('SELECT * FROM batches WHERE id=?', (batch_id,)).fetchone()
@@ -492,6 +507,7 @@ class Storage:
             data['series'] = [self._series(db, r) for r in
                               db.execute('SELECT * FROM series WHERE batch_id=? ORDER BY position',
                                          (batch_id,))]
+            data['elo_delta'] = self._elo_delta(db, batch_id, data['team_id'])
             return data
 
     def batches(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -505,6 +521,7 @@ class Storage:
                 data['progress'] = dict(db.execute(
                     "SELECT COUNT(*) AS total, SUM(status='COMPLETED') AS done, "
                     "SUM(status='VOID') AS failed FROM series WHERE batch_id=?", (row['id'],)).fetchone())
+                data['elo_delta'] = self._elo_delta(db, row['id'], data['team_id'])
                 out.append(data)
             return out
 
