@@ -145,6 +145,43 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(row['progress'], {'total': 1, 'done': 1, 'failed': 0})
         self.assertEqual(row['elo_delta'], 12.0)
 
+    def test_schema_three_upgrades_in_place(self):
+        # Regression: the version guard rejected schema 3 before the upgrade step
+        # could run, so an existing data directory refused to start at all.
+        from robocon_sim.storage import SCHEMA
+        root = Path(self.temp.name) / 'v3'
+        root.mkdir()
+        db = sqlite3.connect(root / 'platform.sqlite3')
+        db.executescript(SCHEMA)
+        db.execute("CREATE UNIQUE INDEX idx_one_official ON versions(team_id) WHERE kind='official'")
+        db.execute('INSERT INTO teams(id,name,created) VALUES(?,?,?)', ('t1', 'kept', 0.0))
+        db.execute('PRAGMA user_version=3')
+        db.commit()
+        db.close()
+        upgraded = Storage(root)
+        with upgraded.connect() as check:
+            self.assertEqual(check.execute('PRAGMA user_version').fetchone()[0], 4)
+            self.assertIsNone(check.execute(
+                "SELECT name FROM sqlite_master WHERE name='idx_one_official'").fetchone())
+            self.assertEqual([r['name'] for r in check.execute('SELECT name FROM teams')], ['kept'])
+        first = upgraded.upload('t1', 'a.py', CODE)
+        second = upgraded.upload('t1', 'b.py', CODE)
+        upgraded.promote(first['id'])
+        upgraded.promote(second['id'])
+        self.assertEqual(sum(1 for v in upgraded.versions('t1') if v['kind'] == 'official'), 2)
+
+    def test_future_schema_is_rejected(self):
+        root = Path(self.temp.name) / 'future'
+        Storage(root)
+        db = sqlite3.connect(root / 'platform.sqlite3')
+        try:
+            db.execute('PRAGMA user_version=99')
+            db.commit()
+        finally:
+            db.close()
+        with self.assertRaisesRegex(ValueError, 'incompatible'):
+            Storage(root)
+
     def test_unversioned_database_is_rejected(self):
         root = Path(self.temp.name) / 'old'
         Storage(root)

@@ -63,6 +63,15 @@ _TEAM_WITH_CURRENT_ELO = """
 """
 
 
+def _upgrade_3_to_4(db: Any) -> None:
+    """Official becomes a one-way badge a team can hold many of, not a single slot."""
+    db.execute('DROP INDEX IF EXISTS idx_one_official')
+
+
+# schema version -> the step that turns it into the next one
+UPGRADES: dict[int, Any] = {3: _upgrade_3_to_4}
+
+
 class ManagedConnection(sqlite3.Connection):
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any):
@@ -100,7 +109,7 @@ class Storage:
             if version == 0 and tables:
                 raise ValueError(
                     'incompatible database (unversioned schema); delete the data directory to start over')
-            if version not in (0, SCHEMA_VERSION):
+            if version != 0 and version != SCHEMA_VERSION and version not in UPGRADES:
                 raise ValueError(
                     f'incompatible database (schema {version}, expected {SCHEMA_VERSION}); '
                     'delete the data directory to start over')
@@ -108,11 +117,14 @@ class Storage:
                 db.executescript(SCHEMA)
                 db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
                 db.commit()
-            elif version == 3:
-                # A team may hold several official entries: being official is a
-                # one-way certification, not a single lineup slot.
-                db.execute('DROP INDEX IF EXISTS idx_one_official')
-                db.execute('PRAGMA user_version=4')
+                return
+            while version < SCHEMA_VERSION:
+                step = UPGRADES.get(version)
+                if step is None:
+                    raise ValueError(f'no upgrade path from schema {version}')
+                step(db)
+                version += 1
+                db.execute(f'PRAGMA user_version={version}')
                 db.commit()
 
     def _recover(self) -> None:

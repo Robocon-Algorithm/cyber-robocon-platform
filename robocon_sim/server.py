@@ -542,8 +542,14 @@ def serve(root: str | Path = 'data/arena', host: str = '127.0.0.1', port: int = 
           trusted_code: bool = False, config_path: str | Path | None = None,
           admin_password: str | None = None) -> None:
     seeded = seed_platform_files(Path(config_path).parent if config_path else Path(root))
-    server = make_server(root, host, port, trusted_code, config_path=config_path,
-                         admin_password=admin_password)
+    try:
+        server = make_server(root, host, port, trusted_code, config_path=config_path,
+                             admin_password=admin_password)
+    except OSError as exc:
+        print('cannot listen on %s:%s — %s' % (host, port, exc), flush=True)
+        print('another copy is probably already running; close it or pick another port, '
+              'for example: --port %s' % (port + 1), flush=True)
+        raise SystemExit(2)
     config = server.app.config.current()
     print('RoboCon local: http://%s:%s — reviewed team code only; process isolation is not a security sandbox'
           % (host, server.server_port), flush=True)
