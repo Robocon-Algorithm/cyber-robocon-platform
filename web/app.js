@@ -175,7 +175,7 @@ function renderTeam() {
   }
   const team = (state.teams || []).find(item => item.id === user.team_id) || {};
   $('team-meta').textContent = team.official_version ? '已有正式策略' : '尚无正式策略';
-  const head = element('div', 'team-head');
+  const head = element('div', undefined, 'team-head');
   head.append(element('b', team.name || user.team_name || '—'));
   head.append(element('strong', String(Math.round(team.elo ?? 1000)), 'team-elo'));
   panel.append(head);
@@ -193,22 +193,30 @@ function renderStrategies() {
     container.replaceChildren();
     if (!list.length) container.textContent = '还没有策略版本';
     for (const version of list) {
-      const row = element('div', 'strategy-row');
-      const title = element('div', 'strategy-title');
+      const row = element('div', undefined, 'strategy-row');
+      const title = element('div', undefined, 'strategy-title');
       title.append(element('b', version.filename));
       title.append(element('span', version.kind === 'official' ? '正式' : '草稿',
         'badge ' + (version.kind === 'official' ? 'official' : 'draft')));
-      const meta = element('small', `${String(version.sha256).slice(0, 8)} · ${stamp(version.created)}`);
-      const actions = element('div', 'strategy-actions');
+      const owner = state.is_admin && version.team_id !== mine ? ` · ${version.team_name || '他队'}` : '';
+      const meta = element('small', `${String(version.sha256).slice(0, 8)} · ${stamp(version.created)}${owner}`);
+      const actions = element('div', undefined, 'strategy-actions');
       const download = element('button', '下载', 'chip-button');
       download.type = 'button';
       download.onclick = () => downloadStrategy(version);
       actions.append(download);
-      if (version.kind !== 'official' && version.team_id === mine) {
-        const promote = element('button', '设为正式', 'chip-button primary');
-        promote.type = 'button';
-        promote.onclick = () => submitOfficial(version);
-        actions.append(promote);
+      if (version.team_id === mine) {
+        if (version.kind === 'official') {
+          const retract = element('button', '撤销正式', 'chip-button');
+          retract.type = 'button';
+          retract.onclick = () => retractOfficial(version);
+          actions.append(retract);
+        } else {
+          const promote = element('button', '设为正式', 'chip-button primary');
+          promote.type = 'button';
+          promote.onclick = () => submitOfficial(version);
+          actions.append(promote);
+        }
       }
       row.append(title, meta, actions);
       container.append(row);
@@ -276,9 +284,9 @@ function renderRanking() {
     return;
   }
   teams.forEach((team, index) => {
-    const row = element('div', 'ranking-row');
+    const row = element('div', undefined, 'ranking-row');
     row.append(element('b', String(index + 1).padStart(2, '0')));
-    const info = element('div', 'ranking-info');
+    const info = element('div', undefined, 'ranking-info');
     info.append(element('b', team.name));
     info.append(element('small', `${team.wins || 0}胜 ${team.draws || 0}平 ${team.losses || 0}负`));
     row.append(info, element('strong', String(Math.round(team.elo))));
@@ -298,8 +306,8 @@ function renderBatches() {
     return;
   }
   for (const batch of batches) {
-    const block = element('div', 'batch');
-    const head = element('div', 'batch-head');
+    const block = element('div', undefined, 'batch');
+    const head = element('div', undefined, 'batch-head');
     head.append(element('span', KIND_NAMES[batch.kind] || batch.kind, 'badge kind-' + batch.kind));
     head.append(element('span', STATUS[batch.status] || batch.status, 'badge ' + batch.status));
     head.append(element('small', `${stamp(batch.created)} · ${batch.progress.done || 0}/${batch.progress.total || 0} 组`));
@@ -310,7 +318,7 @@ function renderBatches() {
     }
     if (batch.team_id === state.user.team_id) head.append(element('small', '由本队发起'));
     block.append(head);
-    const seriesList = element('div', 'series-list');
+    const seriesList = element('div', undefined, 'series-list');
     for (const series of batch.series || []) {
       seriesList.append(seriesRow(series));
     }
@@ -320,7 +328,7 @@ function renderBatches() {
 }
 
 function seriesRow(series) {
-  const row = element('div', 'series-row');
+  const row = element('div', undefined, 'series-row');
   const result = series.result || [];
   let aWins = 0;
   let bWins = 0;
@@ -330,7 +338,7 @@ function seriesRow(series) {
     if ((aIsRed && game.winner === 'red') || (!aIsRed && game.winner === 'blue')) aWins += 1;
     else bWins += 1;
   });
-  const label = element('div', 'series-teams');
+  const label = element('div', undefined, 'series-teams');
   label.append(element('b', teamName(series.a)));
   label.append(element('span', series.count > 1 ? `${aWins} : ${bWins}` : (result.length ? '单局' : '—'), 'series-score'));
   label.append(element('b', teamName(series.b)));
@@ -367,8 +375,8 @@ function renderAdmin() {
   container.classList.toggle('empty', users.length === 0);
   container.replaceChildren();
   for (const user of users) {
-    const row = element('div', 'strategy-row');
-    const title = element('div', 'strategy-title');
+    const row = element('div', undefined, 'strategy-row');
+    const title = element('div', undefined, 'strategy-title');
     title.append(element('b', user.name));
     title.append(element('span', user.role === 'admin' ? '管理员' : '队员',
       'badge ' + (user.role === 'admin' ? 'official' : 'draft')));
@@ -465,6 +473,19 @@ async function submitOfficial(version) {
     notice(reply.waiting
       ? '已设为正式策略，等待其他队伍提交后可交手'
       : `正式循环赛已排队：${reply.series} 组换边双局`);
+    await refresh();
+  } catch (error) {
+    notice(error.message);
+  }
+}
+
+async function retractOfficial(version) {
+  try {
+    const reply = await api('/api/strategies/' + version.id + '/retract', {}, 'POST');
+    notice(reply.pending_series
+      ? `已撤销为草稿；仍有 ${reply.pending_series} 组已排队的正式对局会照常结算`
+      : '已撤销为草稿，不再进入正式循环赛');
+    signatures.strategies = '';
     await refresh();
   } catch (error) {
     notice(error.message);

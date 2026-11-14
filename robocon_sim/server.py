@@ -202,20 +202,23 @@ class Application:
             raise ApiError(403, 'this account has no team; ask an administrator')
         team_id = user['team_id']
         version = self._version_row(team_id, version_id)
-        self.storage.promote(version['id'])
         opponents = self._opponents(team_id)
         if not opponents:
             # First official entry on the platform: nothing to play yet. Later
             # submissions from other teams will schedule series against it.
+            self.storage.promote(version['id'])
             return {'id': None, 'kind': 'official', 'series': 0, 'version': version['id'],
                     'waiting': True}
         own = {'team': team_id, 'version': version['id']}
         plan = self._plan('official', own, opponents, OFFICIAL_GAMES, payload)
+        # Queue first, promote second: a rejected batch must not leave a version
+        # marked official with no round robin behind it.
         batch_id = self.storage.create_batch(
             'official', team_id, user['id'], [spec for spec, _ in plan],
             {'kind': 'official', 'count': OFFICIAL_GAMES, 'version': version['id'],
              'opponents': [o['team'] for o in opponents],
              'notes': [note for _, note in plan]})
+        self.storage.promote(version['id'])
         return {'id': batch_id, 'kind': 'official', 'series': len(plan), 'version': version['id']}
 
     # -- helpers -----------------------------------------------------------
@@ -471,6 +474,12 @@ def handler_for(app: Application):
                     return
                 if route.startswith('/api/strategies/') and route.endswith('/official'):
                     self.respond(200, app.submit_official(user, route.split('/')[3], payload))
+                    return
+                if route.startswith('/api/strategies/') and route.endswith('/retract'):
+                    if not user.get('team_id'):
+                        raise ApiError(403, 'this account has no team; ask an administrator')
+                    row = app._version_row(user['team_id'], route.split('/')[3])
+                    self.respond(200, app.storage.retract(row['id']))
                     return
                 if route == '/api/password':
                     self.storage.change_password(user['id'], payload.get('current', ''),

@@ -300,6 +300,29 @@ class Storage:
             db.execute("UPDATE versions SET kind='official', retired=NULL WHERE id=?", (version_id,))
             return dict(db.execute('SELECT * FROM versions WHERE id=?', (version_id,)).fetchone())
 
+    def retract(self, version_id: str) -> dict[str, Any]:
+        """Take an entry out of official play without deleting its history.
+
+        Already-queued series keep running: they were scheduled against this entry
+        before the retraction, and cancelling them would void another team's work.
+        The count is returned so the caller can say so out loud.
+        """
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM versions WHERE id=?', (version_id,)).fetchone()
+            if row is None:
+                raise ValueError('unknown strategy version')
+            pending = db.execute(
+                "SELECT COUNT(*) FROM series s JOIN batches b ON b.id=s.batch_id "
+                "WHERE b.status IN ('QUEUED','RUNNING') AND (s.a_version=? OR s.b_version=?)",
+                (version_id, version_id)).fetchone()[0]
+            if row['kind'] == 'official':
+                db.execute("UPDATE versions SET kind='draft', retired=? WHERE id=?",
+                           (time.time(), version_id))
+            data = dict(db.execute('SELECT * FROM versions WHERE id=?', (version_id,)).fetchone())
+            data['pending_series'] = pending
+            return data
+
     # -- batches -----------------------------------------------------------
 
     def create_batch(self, kind: str, team_id: str, requested_by: str | None,
@@ -341,7 +364,9 @@ class Storage:
             for team in sorted(involved):
                 holder = db.execute('SELECT batch_id FROM occupancy WHERE team_id=?', (team,)).fetchone()
                 if holder:
-                    raise ValueError('team already has a queued match')
+                    found = db.execute('SELECT name FROM teams WHERE id=?', (team,)).fetchone()
+                    raise ValueError(f"队伍「{found['name'] if found else team}」还有未完成的对局，"
+                                     "等它跑完再创建")
                 db.execute('INSERT INTO occupancy VALUES(?,?)', (team, batch_id))
             db.execute('INSERT INTO batches(id,kind,team_id,requested_by,status,config,created) '
                        "VALUES(?,?,?,?,'QUEUED',?,?)",
@@ -510,18 +535,46 @@ class Storage:
             data['elo_delta'] = self._elo_delta(db, batch_id, data['team_id'])
             return data
 
+    def _series_brief(self, row: Any) -> dict[str, Any]:
+        """What the queue needs to draw one series, without the version lookups."""
+        data = dict(row)
+        if data.get('result'):
+            data['result'] = json.loads(data['result'])
+        return {key: data.get(key) for key in
+                ('id', 'batch_id', 'position', 'a', 'b', 'count', 'status', 'ranked',
+                 'result', 'red_profile', 'blue_profile')}
+
     def batches(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.connect() as db:
+            rows = db.execute('SELECT * FROM batches ORDER BY created DESC LIMIT ?', (limit,)).fetchall()
+            if not rows:
+                return []
+            ids = [row['id'] for row in rows]
+            marks = ','.join('?' * len(ids))
+            series: dict[str, list[dict[str, Any]]] = {}
+            for row in db.execute(
+                    f'SELECT * FROM series WHERE batch_id IN ({marks}) ORDER BY position', ids):
+                series.setdefault(row['batch_id'], []).append(self._series_brief(row))
+            deltas = {row['bid']: row['delta'] for row in db.execute(
+                'SELECT x.batch_id AS bid, '
+                'SUM(CASE WHEN x.a=b.team_id THEN s.delta ELSE -s.delta END) AS delta '
+                'FROM settlements s JOIN series x ON x.id=s.series_id '
+                'JOIN batches b ON b.id=x.batch_id '
+                f'WHERE x.batch_id IN ({marks}) GROUP BY x.batch_id', ids)}
             out = []
-            for row in db.execute('SELECT * FROM batches ORDER BY created DESC LIMIT ?', (limit,)):
+            for row in rows:
                 data = dict(row)
                 for field in ('config', 'result'):
                     if data.get(field):
                         data[field] = json.loads(data[field])
-                data['progress'] = dict(db.execute(
-                    "SELECT COUNT(*) AS total, SUM(status='COMPLETED') AS done, "
-                    "SUM(status='VOID') AS failed FROM series WHERE batch_id=?", (row['id'],)).fetchone())
-                data['elo_delta'] = self._elo_delta(db, row['id'], data['team_id'])
+                rows_series = series.get(row['id'], [])
+                data['series'] = rows_series
+                data['progress'] = {
+                    'total': len(rows_series),
+                    'done': sum(1 for s in rows_series if s['status'] == 'COMPLETED'),
+                    'failed': sum(1 for s in rows_series if s['status'] == 'VOID'),
+                }
+                data['elo_delta'] = round(deltas.get(row['id'], 0.0), 4)
                 out.append(data)
             return out
 
@@ -541,10 +594,24 @@ class Storage:
 
     # -- views -------------------------------------------------------------
 
+    def rating_profile(self) -> str:
+        """The pool the table is shown for: the one with the most settled pairs.
+
+        Ratings are keyed by profile digest, and the key changes whenever the
+        physical parameters change, so the ranking must not assume a fixed name.
+        """
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT rating_timing_profile AS pool, COUNT(*) AS pairs FROM series "
+                "WHERE ranked=1 AND rating_timing_profile IS NOT NULL "
+                "GROUP BY pool ORDER BY pairs DESC, pool LIMIT 1").fetchone()
+        return row['pool'] if row else RATING_TIMING_PROFILE
+
     def ranking(self) -> list[dict[str, Any]]:
+        pool = self.rating_profile()
         with self.connect() as db:
             rows = db.execute(_TEAM_WITH_CURRENT_ELO + ' ORDER BY elo DESC, t.name',
-                              (INITIAL_ELO, RATING_TIMING_PROFILE))
+                              (INITIAL_ELO, pool))
             out = []
             for row in rows:
                 data = dict(row)
@@ -559,6 +626,7 @@ class Storage:
                 data['wins'] = record['wins'] or 0
                 data['draws'] = record['draws'] or 0
                 data['losses'] = max(0, data['pairs'] - data['wins'] - data['draws'])
+                data['rating_profile'] = pool
                 out.append(data)
             return out
 

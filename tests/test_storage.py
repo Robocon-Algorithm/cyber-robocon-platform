@@ -44,7 +44,7 @@ class StorageTests(unittest.TestCase):
 
     def test_team_cannot_have_two_open_batches(self):
         self.storage.create_series(self.versions['A'], self.versions['B'], 2)
-        with self.assertRaisesRegex(ValueError, 'already has a queued match'):
+        with self.assertRaisesRegex(ValueError, '未完成的对局'):
             self.storage.create_series(self.versions['A'], self.versions['C'], 2)
         batch = self.storage.claim_batch()
         self.storage.finish_batch(batch['id'], batch['lease'], 'VOID', {})
@@ -98,6 +98,43 @@ class StorageTests(unittest.TestCase):
         ranked = {t['name']: t for t in self.storage.ranking()}
         self.assertEqual(ranked['A']['official_version'], second['id'])
         self.assertIsNone(ranked['B']['official_version'])
+
+    def test_ranking_reads_the_profile_pool_that_settled(self):
+        # Regression: the table joined a fixed legacy pool name while settlements
+        # were written under the profile digest, so Elo never moved.
+        series_id = self.storage.create_series(self.versions['A'], self.versions['B'], 2,
+                                               ranked=True, rating_profile='baseline@abcd1234')
+        batch = self.storage.claim_batch()
+        # Game 1 puts A on red and game 2 on blue, so 'red' then 'blue' is a 2-0.
+        self.storage.finish_series(batch['id'], batch['lease'], series_id,
+                                   [{'winner': 'red'}, {'winner': 'blue'}])
+        self.storage.finish_batch(batch['id'], batch['lease'], 'COMPLETED', {})
+        ranking = {t['name']: t for t in self.storage.ranking()}
+        self.assertEqual(ranking['A']['elo'], 1012)
+        self.assertEqual(ranking['B']['elo'], 988)
+        self.assertEqual(ranking['A']['rating_profile'], 'baseline@abcd1234')
+
+    def test_batch_list_carries_series_so_replays_can_be_opened(self):
+        series_id = self.storage.create_series(self.versions['A'], self.versions['B'], 2, ranked=True)
+        batch = self.storage.claim_batch()
+        self.storage.finish_series(batch['id'], batch['lease'], series_id,
+                                   [{'winner': 'red'}, {'winner': 'blue'}])
+        self.storage.finish_batch(batch['id'], batch['lease'], 'COMPLETED', {})
+        row = self.storage.batches()[0]
+        self.assertEqual([s['id'] for s in row['series']], [series_id])
+        self.assertEqual(row['series'][0]['status'], 'COMPLETED')
+        self.assertEqual(len(row['series'][0]['result']), 2)
+        self.assertEqual(row['progress'], {'total': 1, 'done': 1, 'failed': 0})
+        self.assertEqual(row['elo_delta'], 12.0)
+
+    def test_retract_returns_the_entry_to_draft(self):
+        team = self.versions['A_team']
+        self.storage.promote(self.versions['A'])
+        self.assertEqual([v['kind'] for v in self.storage.versions(team)], ['official'])
+        result = self.storage.retract(self.versions['A'])
+        self.assertEqual(result['kind'], 'draft')
+        self.assertEqual([v['kind'] for v in self.storage.versions(team)], ['draft'])
+        self.assertIsNone({t['name']: t for t in self.storage.ranking()}['A']['official_version'])
 
     def test_unversioned_database_is_rejected(self):
         root = Path(self.temp.name) / 'old'

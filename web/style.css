@@ -113,3 +113,5 @@
 .ranking-info small{font-size:10px}
 .elo-up{color:#437442}
 .elo-down{color:var(--blue)}
+
+[hidden]{display:none !important}
