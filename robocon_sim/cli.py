@@ -52,10 +52,11 @@ def main(argv: list[str] | None=None) -> None:
     p.add_argument('--data', default='data/arena')
     p.add_argument('--config', help='platform config JSON (default: <data>/platform.json)')
     p.add_argument('--trusted-code', action='store_true')
+    p.add_argument('--admin-password', help='password for the first administrator account')
     args = parser.parse_args(argv)
     if args.command == 'serve':
         from .server import serve
-        serve(args.data, args.host, args.port, args.trusted_code, args.config)
+        serve(args.data, args.host, args.port, args.trusted_code, args.config, args.admin_password)
         return
     if args.command == 'replay':
         result = verify_replay(args.directory)
@@ -85,8 +86,8 @@ def main(argv: list[str] | None=None) -> None:
                                                 blue_profile=blue_profile)[0],
                                args.output, platform.frame.to_dict())
         else:
+            from .server import execute_series
             from .storage import Storage
-            from .server import execute_job
             storage = Storage(args.output)
             ids = []
             for name, path in [('Strategy A', args.red), ('Strategy B', args.blue)]:
@@ -95,16 +96,23 @@ def main(argv: list[str] | None=None) -> None:
             red = platform.profile(red_profile, 'red')
             blue = platform.profile(blue_profile, 'blue')
             matches = platform.matches(args.count, overrides, red_profile=red.name, blue_profile=blue.name)
-            ident = storage.create_series(*ids, args.count, matches=matches,
-                                          ranked=overrides is None and args.count > 1
-                                          and red.parameters == blue.parameters,
-                                          red_profile=red.name, blue_profile=blue.name,
-                                          rating_profile=red.rating_key())
-            job = storage.claim(ident)
+            ranked = overrides is None and args.count > 1 and red.parameters == blue.parameters
+            team_id = storage.versions()[0]['team_id']
+            batch_id = storage.create_batch(
+                'official' if ranked else 'manual', team_id, None,
+                [{'a_version': ids[0], 'b_version': ids[1], 'count': args.count, 'matches': matches,
+                  'ranked': ranked, 'rating_profile': red.rating_key(),
+                  'red_profile': red.name, 'blue_profile': blue.name}],
+                {'kind': 'official' if ranked else 'manual', 'count': args.count})
+            claimed = storage.claim_batch()
+            series = claimed['series'][0]
             try:
-                execute_job(storage, job, platform.frame.to_dict())
+                results = execute_series(storage, claimed, series, platform.frame.to_dict())
             except Exception as exc:
-                storage.failed(ident, job['lease'], repr(exc), max_attempts=1)
+                storage.fail_series(batch_id, claimed['lease'], series['id'], repr(exc), max_attempts=0)
+                storage.finish_batch(batch_id, claimed['lease'], 'VOID', {'error': repr(exc)})
                 raise
-            result = storage.job(ident)
+            storage.finish_series(batch_id, claimed['lease'], series['id'], results)
+            storage.finish_batch(batch_id, claimed['lease'], 'COMPLETED', {'series': 1, 'completed': 1})
+            result = storage.batch(batch_id)
     print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -7,24 +7,25 @@ const SIDE_NAMES = {red: '红方', blue: '蓝方'};
 const CARGO_NAMES = {box: '箱', cap: '顶', ball: '球'};
 const CARGO_NAMES_FULL = {box: '箱体', cap: '塔顶', ball: '五色石'};
 const REACH_COLOR = '#68541c';
-const STATUS = {QUEUED: '排队中', RUNNING: '运行中', COMPLETED: '已完成', VOID: '已作废'};
+const STATUS = {QUEUED: '排队中', RUNNING: '运行中', COMPLETED: '已完成', PARTIAL: '部分完成', VOID: '已作废'};
+const KIND_NAMES = {manual: '手动', auto_round: '自动一轮', all_play: '全对全', official: '正式'};
 const canvas = $('arena');
 const ctx = canvas.getContext('2d');
 
-let token = '';
-let catalog = {teams: [], versions: [], jobs: []};
+let session = null;
+let state = null;
 let replay = null;
 let replayTeams = SIDE_NAMES;
 let frame = 0;
 let playing = false;
 let playtime = 0;
 let lastTime = 0;
-let requestNumber = 0;
-let currentJob = null;
-let currentIndex = 0;
-let chunkCache = new Map();
 let frameRequest = 0;
-let platformConfig = null;
+let chunkCache = new Map();
+let currentSeries = null;
+let currentIndex = 0;
+let pollTimer = null;
+let signatures = {};
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -40,100 +41,338 @@ function notice(message) {
   notice.timer = setTimeout(() => $('notice').classList.remove('visible'), 6000);
 }
 
-async function api(path, data) {
-  const options = data ? {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json', 'X-Robocon-Token': token},
-    body: JSON.stringify(data),
-  } : {};
+async function api(path, body, method = 'GET') {
+  const options = {method, headers: {}};
+  if (session && session.token) options.headers['X-Robocon-Session'] = session.token;
+  if (body !== undefined) {
+    options.headers['Content-Type'] = 'application/json';
+    options.body = JSON.stringify(body);
+  }
   const response = await fetch(path, options);
-  const value = await response.json();
+  const value = await response.json().catch(() => ({}));
   if (!response.ok) throw Error(value.error || '请求失败');
   return value;
 }
 
-function teamName(id, fallback = '队伍') {
-  return catalog.teams.find(team => team.id === id)?.name || fallback;
+function teamName(id) {
+  const team = (state?.teams || []).find(item => item.id === id);
+  return team ? team.name : String(id || '').slice(0, 8);
 }
 
-function renderSelectors() {
-  for (const id of ['strategy-a', 'strategy-b']) {
-    const select = $(id);
-    const oldValue = select.value;
-    select.replaceChildren();
-    for (const version of catalog.versions) {
-      const title = teamName(version.team_id) + ' / ' + version.filename + ' · ' + version.sha256.slice(0, 7);
-      select.append(new Option(title, version.id));
-    }
-    if ([...select.options].some(option => option.value === oldValue)) {
-      select.value = oldValue;
-    } else if (id === 'strategy-b' && select.options.length > 1) {
-      const otherTeam = catalog.versions.findIndex(version => version.team_id !== catalog.versions[0].team_id);
-      if (otherTeam >= 0) select.selectedIndex = otherTeam;
+function stamp(seconds) {
+  if (!seconds) return '—';
+  const date = new Date(seconds * 1000);
+  return date.toLocaleString('zh-CN', {month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'});
+}
+
+/* ---------------------------------------------------------------- session */
+
+$('login-form').onsubmit = async event => {
+  event.preventDefault();
+  const button = event.submitter;
+  button.disabled = true;
+  try {
+    session = await api('/api/login', {name: $('login-name').value.trim(), password: $('login-password').value}, 'POST');
+    sessionStorage.setItem('br-token', session.token);
+    $('login-password').value = '';
+    $('login-hint').textContent = '账号由管理员创建。首次启动时终端会打印管理员密码。';
+    await enterApp();
+  } catch (error) {
+    notice(error.message);
+    $('login-hint').textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+};
+
+async function enterApp() {
+  $('login-view').hidden = true;
+  $('app-view').hidden = false;
+  const chip = $('user-chip');
+  chip.hidden = false;
+  chip.replaceChildren(
+    element('b', session.user.name),
+    element('small', session.user.team_name || '管理员'),
+  );
+  const quit = element('button', '退出', 'chip-button');
+  quit.type = 'button';
+  quit.onclick = logout;
+  chip.append(quit);
+  await refresh();
+  if (!pollTimer) pollTimer = setInterval(() => refresh(true).catch(() => {}), 1500);
+}
+
+async function logout() {
+  try { await api('/api/logout', {}, 'POST'); } catch { /* already gone */ }
+  sessionStorage.removeItem('br-token');
+  session = null;
+  state = null;
+  replay = null;
+  chunkCache = new Map();
+  currentSeries = null;
+  clearInterval(pollTimer);
+  pollTimer = null;
+  $('app-view').hidden = true;
+  $('login-view').hidden = false;
+  $('user-chip').hidden = true;
+  $('user-chip').replaceChildren();
+  resetReplayView();
+}
+
+async function boot() {
+  draw({});
+  const stored = sessionStorage.getItem('br-token');
+  if (stored) {
+    session = {token: stored, user: null};
+    try {
+      const current = await api('/api/session');
+      if (current.user) {
+        session.user = current.user;
+        await enterApp();
+        return;
+      }
+    } catch { /* expired or server restarted */ }
+    session = null;
+    sessionStorage.removeItem('br-token');
+  }
+  showLogin();
+}
+
+function showLogin() {
+  $('login-view').hidden = false;
+  $('app-view').hidden = true;
+  $('user-chip').hidden = true;
+}
+
+/* ------------------------------------------------------------- app state */
+
+async function refresh(quiet = false) {
+  if (!session) return;
+  try {
+    state = await api('/api/state');
+  } catch (error) {
+    if (!quiet) notice(error.message);
+    if (String(error.message).includes('login')) logout();
+    return;
+  }
+  $('queue-label').textContent = '串行调度 · 版本已冻结';
+  renderTeam();
+  renderStrategies();
+  renderBattleSelects();
+  renderRanking();
+  renderBatches();
+  renderAdmin();
+}
+
+function renderTeam() {
+  const panel = $('team-panel');
+  panel.replaceChildren();
+  const user = state.user;
+  if (!user.team_id) {
+    $('team-meta').textContent = user.role === 'admin' ? '管理员' : '—';
+    panel.append(element('p', '此账号不参与对战。用管理员账号创建队伍与队员。'));
+    return;
+  }
+  const team = (state.teams || []).find(item => item.id === user.team_id) || {};
+  $('team-meta').textContent = team.official_version ? '已有正式策略' : '尚无正式策略';
+  const head = element('div', 'team-head');
+  head.append(element('b', team.name || user.team_name || '—'));
+  head.append(element('strong', String(Math.round(team.elo ?? 1000)), 'team-elo'));
+  panel.append(head);
+  panel.append(element('p', `胜 ${team.wins || 0} · 平 ${team.draws || 0} · 负 ${team.losses || 0} · 共 ${team.pairs || 0} 组`, 'hint'));
+}
+
+function renderStrategies() {
+  const list = state.strategies || [];
+  const mine = state.user.team_id;
+  const signature = list.map(v => `${v.id}:${v.kind}`).join(',');
+  const container = $('strategies');
+  container.classList.toggle('empty', list.length === 0);
+  if (signatures.strategies !== signature) {
+    signatures.strategies = signature;
+    container.replaceChildren();
+    if (!list.length) container.textContent = '还没有策略版本';
+    for (const version of list) {
+      const row = element('div', 'strategy-row');
+      const title = element('div', 'strategy-title');
+      title.append(element('b', version.filename));
+      title.append(element('span', version.kind === 'official' ? '正式' : '草稿',
+        'badge ' + (version.kind === 'official' ? 'official' : 'draft')));
+      const meta = element('small', `${String(version.sha256).slice(0, 8)} · ${stamp(version.created)}`);
+      const actions = element('div', 'strategy-actions');
+      const download = element('button', '下载', 'chip-button');
+      download.type = 'button';
+      download.onclick = () => downloadStrategy(version);
+      actions.append(download);
+      if (version.kind !== 'official' && version.team_id === mine) {
+        const promote = element('button', '设为正式', 'chip-button primary');
+        promote.type = 'button';
+        promote.onclick = () => submitOfficial(version);
+        actions.append(promote);
+      }
+      row.append(title, meta, actions);
+      container.append(row);
     }
   }
+  const select = $('battle-version');
+  const selected = select.value;
+  const options = list.filter(v => v.team_id === mine);
+  if (signatures.versions !== options.map(v => v.id).join(',')) {
+    signatures.versions = options.map(v => v.id).join(',');
+    select.replaceChildren();
+    for (const version of options) {
+      const option = element('option', `${version.filename}${version.kind === 'official' ? ' · 正式' : ''}`);
+      option.value = version.id;
+      select.append(option);
+    }
+    const official = options.find(v => v.kind === 'official');
+    select.value = (official || options[0] || {}).id || '';
+  }
+  if (selected && options.some(v => v.id === selected)) select.value = selected;
+}
+
+function renderBattleSelects() {
+  const opponents = (state.teams || []).filter(t => t.official_version && t.id !== state.user.team_id);
+  const signature = opponents.map(t => `${t.id}:${t.official_version}`).join(',');
+  const select = $('battle-opponent');
+  if (signatures.opponents !== signature) {
+    signatures.opponents = signature;
+    const keep = select.value;
+    select.replaceChildren();
+    for (const team of opponents) {
+      const option = element('option', team.name);
+      option.value = team.official_version;
+      select.append(option);
+    }
+    if (opponents.some(t => t.official_version === keep)) select.value = keep;
+  }
+  const profiles = state.platform.profiles || [];
+  const profileSignature = profiles.map(p => `${p.name}:${p.digest}`).join(',');
+  if (signatures.profiles !== profileSignature) {
+    signatures.profiles = profileSignature;
+    for (const side of SIDES) {
+      const picker = $(side + '-profile');
+      picker.replaceChildren();
+      for (const profile of profiles) {
+        const option = element('option', profile.label);
+        option.value = profile.name;
+        option.title = profile.notes || '';
+        picker.append(option);
+      }
+      picker.value = state.platform.default_profiles?.[side] || profiles[0]?.name || '';
+    }
+  }
+  $('battle-meta').textContent = opponents.length
+    ? `可挑战 ${opponents.length} 队`
+    : '暂无对手正式策略';
 }
 
 function renderRanking() {
-  const ranking = $('ranking');
-  ranking.replaceChildren();
-  if (!catalog.teams.length) {
-    ranking.append(element('p', '上传两份策略，开始第一组对战。', 'hint'));
+  const container = $('ranking');
+  container.replaceChildren();
+  const teams = state.teams || [];
+  if (!teams.length) {
+    container.append(element('p', '还没有队伍', 'hint'));
+    return;
   }
-  catalog.teams.forEach((team, index) => {
-    const row = element('div', undefined, 'ranking-row');
-    row.append(
-      element('small', String(index + 1).padStart(2, '0')),
-      element('span', team.name),
-      element('strong', team.elo.toFixed(1)),
-    );
-    ranking.append(row);
+  teams.forEach((team, index) => {
+    const row = element('div', 'ranking-row');
+    row.append(element('b', String(index + 1).padStart(2, '0')));
+    const info = element('div', 'ranking-info');
+    info.append(element('b', team.name));
+    info.append(element('small', `${team.wins || 0}胜 ${team.draws || 0}平 ${team.losses || 0}负`));
+    row.append(info, element('strong', String(Math.round(team.elo))));
+    container.append(row);
   });
 }
 
-function renderJobs() {
-  const jobs = $('jobs');
-  jobs.replaceChildren();
-  if (!catalog.jobs.length) {
-    jobs.append(element('div', '暂无任务。策略上传后即可创建对战。', 'empty'));
+function renderBatches() {
+  const container = $('batches');
+  const batches = state.batches || [];
+  const signature = batches.map(b => `${b.id}:${b.status}:${b.progress.done}:${b.progress.failed}`).join(',');
+  if (signatures.batches === signature) return;
+  signatures.batches = signature;
+  container.replaceChildren();
+  if (!batches.length) {
+    container.append(element('p', '还没有对战记录', 'hint'));
+    return;
   }
-  for (const job of catalog.jobs) {
-    const row = element('div', undefined, 'job');
-    const info = element('div', undefined, 'job-info');
-    const description = job.count + ' 局 · 尝试 ' + job.attempt + ' · ' + job.id.slice(0, 8);
-    info.append(
-      element('b', teamName(job.a, 'A') + ' × ' + teamName(job.b, 'B')),
-      element('small', description + (job.error ? ' · ' + job.error : '')),
-    );
-    row.append(info, element('span', STATUS[job.status] || job.status, 'badge ' + job.status));
-    if (job.status === 'COMPLETED') {
-      for (const [group, stats] of Object.entries(job.summary || {})) {
-        const details = ['A', 'B'].map(side => {
-          const team = stats.teams[side];
-          return side + ' 均分 ' + team.average_score.toFixed(1) + ' · 胜 ' + (team.wins || 0) + '/' + team.games;
-        });
-        info.append(element('small', (group === 'fault' ? '故障组' : '常规组') + '：' + details.join(' / ')));
-      }
-      const actions = element('div', undefined, 'job-actions');
-      job.result.forEach((result, index) => {
-        const score = (result.scores?.red ?? '—') + ':' + (result.scores?.blue ?? '—');
-        const button = element('button', '第 ' + (index + 1) + ' 局 ' + score);
-        button.onclick = () => loadReplay(job, index);
-        actions.append(button);
-      });
-      row.append(actions);
+  for (const batch of batches) {
+    const block = element('div', 'batch');
+    const head = element('div', 'batch-head');
+    head.append(element('span', KIND_NAMES[batch.kind] || batch.kind, 'badge kind-' + batch.kind));
+    head.append(element('span', STATUS[batch.status] || batch.status, 'badge ' + batch.status));
+    head.append(element('small', `${stamp(batch.created)} · ${batch.progress.done || 0}/${batch.progress.total || 0} 组`));
+    if (batch.team_id === state.user.team_id) head.append(element('small', '由本队发起'));
+    block.append(head);
+    const seriesList = element('div', 'series-list');
+    for (const series of batch.series || []) {
+      seriesList.append(seriesRow(series));
     }
-    jobs.append(row);
+    block.append(seriesList);
+    container.append(block);
   }
 }
 
-function renderCatalog(data) {
-  if (JSON.stringify(catalog) === JSON.stringify(data)) return;
-  catalog = data;
-  renderSelectors();
-  renderRanking();
-  renderJobs();
+function seriesRow(series) {
+  const row = element('div', 'series-row');
+  const result = series.result || [];
+  let aWins = 0;
+  let bWins = 0;
+  result.forEach((game, index) => {
+    if (!game.winner) return;
+    const aIsRed = index % 2 === 0;
+    if ((aIsRed && game.winner === 'red') || (!aIsRed && game.winner === 'blue')) aWins += 1;
+    else bWins += 1;
+  });
+  const label = element('div', 'series-teams');
+  label.append(element('b', teamName(series.a)));
+  label.append(element('span', series.count > 1 ? `${aWins} : ${bWins}` : (result.length ? '单局' : '—'), 'series-score'));
+  label.append(element('b', teamName(series.b)));
+  row.append(label);
+  row.append(element('small', STATUS[series.status] || series.status, 'series-status'));
+  if (result.length) {
+    result.forEach((game, index) => {
+      const open = element('button', result.length > 1 ? `第 ${index + 1} 局` : '回放', 'chip-button');
+      open.type = 'button';
+      open.onclick = () => openReplay(series.id, index);
+      row.append(open);
+    });
+  }
+  return row;
 }
+
+function renderAdmin() {
+  const panel = $('admin-panel');
+  panel.hidden = !state.is_admin;
+  if (!state.is_admin) return;
+  const teams = $('new-user-team');
+  const signature = (state.teams || []).map(t => t.id + t.name).join(',');
+  if (signatures.adminTeams !== signature) {
+    signatures.adminTeams = signature;
+    teams.replaceChildren();
+    for (const team of state.teams || []) {
+      const option = element('option', team.name);
+      option.value = team.id;
+      teams.append(option);
+    }
+  }
+  const users = state.users || [];
+  const container = $('user-list');
+  container.classList.toggle('empty', users.length === 0);
+  container.replaceChildren();
+  for (const user of users) {
+    const row = element('div', 'strategy-row');
+    const title = element('div', 'strategy-title');
+    title.append(element('b', user.name));
+    title.append(element('span', user.role === 'admin' ? '管理员' : '队员',
+      'badge ' + (user.role === 'admin' ? 'official' : 'draft')));
+    row.append(title, element('small', user.team_name || '不参与对战'));
+    container.append(row);
+  }
+}
+
+/* --------------------------------------------------------------- actions */
 
 $('upload-form').onsubmit = async event => {
   event.preventDefault();
@@ -141,18 +380,13 @@ $('upload-form').onsubmit = async event => {
   button.disabled = true;
   try {
     const file = $('file').files[0];
-    if (!file || !file.name.toLowerCase().endsWith('.py') || file.size > 262144) {
-      throw Error('请选择不超过 256 KiB 的 .py 文件');
-    }
-    const source = new TextDecoder('utf-8', {fatal: true}).decode(await file.arrayBuffer());
-    const result = await api('/api/upload', {
-      team_name: $('team-name').value,
-      filename: file.name,
-      source,
-    });
+    if (!file) return;
+    const source = await file.text();
+    const result = await api('/api/strategies', {filename: file.name, source}, 'POST');
     $('upload-status').textContent = '版本已冻结：' + result.sha256.slice(0, 12) + ' · 语法与入口检查通过';
+    $('file').value = '';
     notice('策略版本已上传');
-    renderCatalog(await api('/api/state'));
+    await refresh();
   } catch (error) {
     notice(error.message);
   } finally {
@@ -160,60 +394,156 @@ $('upload-form').onsubmit = async event => {
   }
 };
 
-$('job-form').onsubmit = async event => {
+$('team-form').onsubmit = async event => {
   event.preventDefault();
-  const button = event.submitter;
-  button.disabled = true;
   try {
-    await api('/api/jobs', {
-      a_version: $('strategy-a').value,
-      b_version: $('strategy-b').value,
-      count: Number(document.querySelector('[name=count]:checked').value),
-      red_profile: $('red-profile').value || undefined,
-      blue_profile: $('blue-profile').value || undefined,
-    });
-    notice('任务已创建，双方策略版本与参数已冻结');
-    renderCatalog(await api('/api/state'));
+    await api('/api/admin/teams', {name: $('new-team').value.trim()}, 'POST');
+    $('new-team').value = '';
+    notice('队伍已创建');
+    signatures.adminTeams = null;
+    await refresh();
   } catch (error) {
     notice(error.message);
-  } finally {
-    button.disabled = false;
   }
 };
 
-async function loadReplay(job, index) {
-  const request = ++requestNumber;
+$('user-form').onsubmit = async event => {
+  event.preventDefault();
+  try {
+    await api('/api/admin/users', {
+      name: $('new-user').value.trim(),
+      password: $('new-password').value,
+      role: $('new-user-role').value,
+      team_id: $('new-user-team').value || null,
+    }, 'POST');
+    $('new-user').value = '';
+    $('new-password').value = '';
+    notice('账号已创建');
+    await refresh();
+  } catch (error) {
+    notice(error.message);
+  }
+};
+
+async function downloadStrategy(version) {
+  try {
+    const response = await fetch('/api/strategies/' + version.id + '/source',
+      {headers: {'X-Robocon-Session': session.token}});
+    if (!response.ok) throw Error('下载失败');
+    const blob = await response.blob();
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = version.filename;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  } catch (error) {
+    notice(error.message);
+  }
+}
+
+async function submitOfficial(version) {
+  try {
+    const reply = await api('/api/strategies/' + version.id + '/official', {}, 'POST');
+    notice(reply.waiting
+      ? '已设为正式策略，等待其他队伍提交后可交手'
+      : `正式循环赛已排队：${reply.series} 组换边双局`);
+    await refresh();
+  } catch (error) {
+    notice(error.message);
+  }
+}
+
+function battlePayload(kind) {
+  const payload = {
+    kind,
+    version_id: $('battle-version').value,
+    red_profile: $('red-profile').value,
+    blue_profile: $('blue-profile').value,
+  };
+  if (kind === 'manual') {
+    payload.opponent_version = $('battle-opponent').value;
+    payload.count = Number(document.querySelector('[name=manual-count]:checked').value);
+    if (!payload.opponent_version) throw Error('先选择一个对手');
+  }
+  return payload;
+}
+
+for (const [id, kind] of [['do-manual', 'manual'], ['do-round', 'auto_round'], ['do-all', 'all_play']]) {
+  $(id).onclick = async event => {
+    const button = event.submitter || $(id);
+    button.disabled = true;
+    try {
+      const reply = await api('/api/batches', battlePayload(kind), 'POST');
+      notice(`已排队 ${reply.series} 组（${KIND_NAMES[kind]}），训练不计分`);
+      await refresh();
+    } catch (error) {
+      notice(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  };
+}
+
+for (const id of ['red-profile', 'blue-profile']) $(id).onchange = () => {
+  const same = $('red-profile').value === $('blue-profile').value;
+  $('battle-hint').textContent = same
+    ? '双方同参数：训练不影响 Elo。'
+    : '双方参数不同：仅作训练记录，不计入 Elo。';
+};
+
+/* ---------------------------------------------------------------- replay */
+
+function resetReplayView() {
+  replay = null;
+  frame = 0;
+  playtime = 0;
+  setPlaying(false);
+  $('timeline').max = 0;
+  $('timeline').value = 0;
+  $('clock').textContent = '000.0';
+  $('frame-detail').textContent = '等待回放数据';
+  $('replay-label').textContent = '选择一个已完成的系列';
+  for (const side of SIDES) {
+    $('team-' + side).textContent = SIDE_NAMES[side];
+    $('score-' + side).textContent = '—';
+  }
+  $('events').classList.add('empty');
+  $('events').textContent = '打开回放查看真实事件';
+  $('ledger').classList.add('empty');
+  $('ledger').textContent = '选择回放后查看分项';
+  draw({});
+}
+
+async function openReplay(seriesId, index) {
   try {
     notice('正在载入比赛包…');
-    const bundle = await api('/api/replay?job=' + encodeURIComponent(job.id) + '&index=' + index);
-    if (request !== requestNumber) return;
-    replay = bundle;
-    currentJob = job;
+    replay = await api('/api/replay?series=' + encodeURIComponent(seriesId) + '&index=' + index);
+    currentSeries = seriesId;
     currentIndex = index;
     chunkCache = new Map();
-    // The scheduler puts A on red in the first leg of each pair, then swaps.
-    const [red, blue] = index % 2 === 0 ? [job.a, job.b] : [job.b, job.a];
-    replayTeams = {red: teamName(red, SIDE_NAMES.red), blue: teamName(blue, SIDE_NAMES.blue)};
+    replayTeams = {red: teamName(replay.series.a), blue: teamName(replay.series.b)};
+    // Odd games swap sides: A drives blue in the second leg.
+    if (index % 2 === 1) replayTeams = {red: teamName(replay.series.b), blue: teamName(replay.series.a)};
     for (const side of SIDES) $('team-' + side).textContent = replayTeams[side];
     frame = 0;
     playtime = 0;
     setPlaying(false);
     $('timeline').max = replay.frame_count - 1;
-    $('replay-label').textContent = job.id.slice(0, 8) + ' / 第 ' + (index + 1) + ' 局 / ' + replay.result.status;
+    $('replay-label').textContent = `${teamName(replay.series.a)} vs ${teamName(replay.series.b)} · 第 ${index + 1} 局`
+      + (replay.series.ranked ? ' · 正式' : ' · 训练');
     renderEvents();
     renderLedger();
     renderMetrics();
     await showFrame(0);
     notice('比赛包已载入');
   } catch (error) {
-    if (request === requestNumber) notice(error.message);
+    notice(error.message);
   }
 }
 
-/* Snapshots are streamed in fixed chunks instead of one JSON blob per match. */
 async function loadChunk(start) {
   if (chunkCache.has(start)) return chunkCache.get(start);
-  const block = await api('/api/replay/frames?job=' + encodeURIComponent(currentJob.id)
+  const block = await api('/api/replay/frames?series=' + encodeURIComponent(currentSeries)
     + '&index=' + currentIndex + '&from=' + start + '&count=' + replay.chunk);
   if (chunkCache.size >= 4) chunkCache.delete(chunkCache.keys().next().value);
   chunkCache.set(start, block);
@@ -240,17 +570,18 @@ async function showFrame(index) {
   const snap = block.frames[target - start];
   if (!snap) return;
   frame = target;
-  const state = snap.state;
+  const game = snap.state;
   $('timeline').value = frame;
   $('clock').textContent = (snap.sim_time_ms / 1000).toFixed(1).padStart(5, '0');
-  for (const side of SIDES) $('score-' + side).textContent = state.score?.[side]?.total ?? '—';
-  const eligibility = side => state.qualified?.[side] ? '✓' : '—';
-  $('frame-detail').textContent = '帧 ' + snap.seq + ' · rev ' + state.world_revision
+  for (const side of SIDES) $('score-' + side).textContent = game.score?.[side]?.total ?? '—';
+  const eligibility = side => game.qualified?.[side] ? '✓' : '—';
+  $('frame-detail').textContent = '帧 ' + snap.seq + ' · rev ' + game.world_revision
     + ' · 资格 R:' + eligibility('red') + ' B:' + eligibility('blue');
-  draw(state);
+  draw(game);
 }
 
 function seekTime(time) {
+  if (!replay) return;
   const times = replay.times_ms;
   let low = 0;
   let high = times.length - 1;
@@ -291,8 +622,7 @@ function renderLedger() {
   container.replaceChildren();
   const groups = Array.isArray(replay.ledger) ? {items: replay.ledger} : replay.ledger;
   for (const [team, items] of Object.entries(groups)) {
-    const title = replayTeams[team] || team;
-    container.append(element('h3', title, team === 'red' ? 'red-text' : 'blue-text'));
+    container.append(element('h3', replayTeams[team] || team, team === 'red' ? 'red-text' : 'blue-text'));
     if (!Array.isArray(items)) {
       container.append(element('pre', JSON.stringify(items, null, 2)));
       continue;
@@ -303,7 +633,7 @@ function renderLedger() {
     }
     const table = element('table');
     const header = table.createTHead().insertRow();
-    for (const label of ['物品 / 落位', '分项', '分值']) header.append(element('th', label));
+    for (const heading of ['物品 / 落位', '分项', '分值']) header.append(element('th', heading));
     const body = table.createTBody();
     for (const item of items) {
       const row = body.insertRow();
@@ -350,29 +680,12 @@ $('timeline').oninput = () => {
 
 $('play').onclick = () => {
   if (!replay) return;
-  if (frame === replay.frame_count - 1) {
+  if (frame >= replay.frame_count - 1) {
     showFrame(0);
     playtime = 0;
   }
   setPlaying(!playing);
 };
-
-function animate(time) {
-  const delta = Math.min(100, time - lastTime);
-  lastTime = time;
-  if (playing && replay) {
-    playtime += delta * Number($('speed').value);
-    let next = frame;
-    while (next < replay.frame_count - 1 && replay.times_ms[next + 1] <= playtime) next++;
-    if (next !== frame) showFrame(next);
-    // Prefetch the next chunk before playback reaches its boundary.
-    const ahead = next + replay.chunk;
-    if (ahead < replay.frame_count) loadChunk(chunkStart(ahead)).catch(() => {});
-    if (frame >= replay.frame_count - 1) setPlaying(false);
-  }
-  requestAnimationFrame(animate);
-}
-
 /* Positions come from the engine. The projection only changes how we draw them. */
 function project(x, y, z = 0) {
   return [500 + (x - y) * 0.039, 100 + (x + y) * 0.021 - z * 0.085];
@@ -729,64 +1042,20 @@ function draw(state) {
   renderFrameDetails(robots, cargoByTeam, reaches);
 }
 
-boot();
-
-async function boot() {
-  try {
-    const data = await api('/api/bootstrap');
-    token = data.token;
-    const {teams, versions, jobs} = data;
-    renderCatalog({teams, versions, jobs});
-    applyPlatformConfig();
-    setInterval(async () => {
-      try {
-        renderCatalog(await api('/api/state'));
-        $('queue-label').textContent = '串行调度 · 版本已冻结';
-      } catch {
-        $('queue-label').textContent = '连接中断，比赛仍由服务器运行';
-      }
-    }, 1800);
-  } catch (error) {
-    notice(error.message);
+function animate(time) {
+  const delta = Math.min(100, time - lastTime);
+  lastTime = time;
+  if (playing && replay) {
+    playtime += delta * Number($('speed').value);
+    let next = frame;
+    while (next < replay.frame_count - 1 && replay.times_ms[next + 1] <= playtime) next++;
+    if (next !== frame) showFrame(next);
+    const ahead = next + replay.chunk;
+    if (ahead < replay.frame_count) loadChunk(chunkStart(ahead)).catch(() => {});
+    if (frame >= replay.frame_count - 1) setPlaying(false);
   }
-  draw({});
   requestAnimationFrame(animate);
 }
 
-/* The match length and frame cadence come from platform.json, not from the page. */
-async function applyPlatformConfig() {
-  try {
-    const config = await api('/api/config');
-    platformConfig = config;
-    const seconds = Math.round(config.default_match.duration_ms / 1000);
-    const tick = config.default_match.tick_ms;
-    const headline = $('config-headline');
-    if (headline) headline.textContent = seconds + ' 秒 · 两台 BR · 一个时钟';
-    if (config.warnings?.length) notice('配置有误，已沿用上一份：' + config.warnings[0].error);
-    document.body.dataset.tickMs = String(tick);
-    for (const side of SIDES) {
-      const select = $(side + '-profile');
-      select.replaceChildren();
-      for (const profile of config.profiles || []) {
-        const option = element('option', profile.label + ' · ' + profile.digest.slice(0, 6));
-        option.value = profile.name;
-        option.title = profile.notes || '';
-        select.append(option);
-      }
-      select.value = config.default_profiles?.[side] || select.options[0]?.value || '';
-      select.onchange = renderProfileNote;
-    }
-    renderProfileNote();
-  } catch {
-    /* the page still works with its own defaults */
-  }
-}
-
-function renderProfileNote() {
-  const note = $('profile-note');
-  if (!note) return;
-  const same = $('red-profile').value === $('blue-profile').value;
-  note.textContent = same
-    ? '  双方同参数，双局/十局计榜。'
-    : '  双方参数不同：只会作为训练记录，不计榜。';
-}
+requestAnimationFrame(animate);
+boot();

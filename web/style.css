@@ -65,3 +65,49 @@
 #reach-status { font-weight: bold; }
 
 .profile-pair{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+
+.user-chip{display:flex;align-items:center;gap:10px;margin-left:12px;border:1px solid var(--ink);padding:8px 12px;font-size:11px}
+.user-chip b{font-size:12px}
+.user-chip small{color:var(--muted)}
+.chip-button{width:auto;font:inherit;font-size:10px;padding:5px 9px;border:1px solid var(--line);background:transparent;color:var(--ink);cursor:pointer}
+.chip-button:hover{background:var(--lime)}
+.chip-button.primary{border-color:var(--ink)}
+.chip-button:disabled{opacity:.45;cursor:wait}
+.login{display:flex;justify-content:center;padding:60px 0 90px}
+.login-card{width:min(420px,100%);border:1px solid var(--line);background:var(--card);padding:34px;gap:16px}
+.login-card h1{font-size:clamp(34px,4vw,52px);margin:6px 0 14px}
+.team-panel{padding:14px 18px}
+.team-head{display:flex;align-items:baseline;gap:10px}
+.team-head b{font-size:16px}
+.team-elo{margin-left:auto;font-family:Consolas,monospace;font-size:22px;font-weight:500}
+.strategy-list{max-height:260px;overflow:auto;padding:6px 18px 16px}
+.strategy-row{padding:10px 0;border-bottom:1px solid var(--line);display:grid;gap:5px}
+.strategy-row:last-child{border-bottom:0}
+.strategy-title{display:flex;align-items:center;gap:8px}
+.strategy-title b{font-size:12px;word-break:break-all}
+.strategy-row small{color:var(--muted);font-size:10px;font-family:Consolas,monospace;word-break:break-all}
+.strategy-actions{display:flex;gap:6px;flex-wrap:wrap}
+.badge{font-size:9px;border:1px solid currentColor;padding:2px 6px;white-space:nowrap}
+.badge.draft{color:var(--muted)}
+.badge.official{color:#437442}
+.badge.QUEUED{color:var(--muted)}
+.badge.RUNNING{color:var(--blue)}
+.badge.COMPLETED{color:#437442}
+.badge.PARTIAL{color:#a8791b}
+.badge.VOID{color:var(--red)}
+.badge.kind-official{color:var(--red)}
+.badge.kind-manual,.badge.kind-auto_round,.badge.kind-all_play{color:var(--muted)}
+.button-row{display:grid;gap:8px}
+.button-row button{justify-content:space-between}
+.batch{border-bottom:1px solid var(--line);padding:10px 18px}
+.batch:last-child{border-bottom:0}
+.batch-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.batch-head small{color:var(--muted);font-size:10px}
+.series-list{display:grid;gap:4px;margin-top:8px}
+.series-row{display:flex;align-items:center;gap:8px;font-size:11px;flex-wrap:wrap}
+.series-teams{display:flex;align-items:center;gap:8px;min-width:190px}
+.series-score{font-family:Consolas,monospace;color:var(--red)}
+.series-status{color:var(--muted);font-size:10px}
+.panel-hint{padding:0 18px 12px}
+.ranking-info{display:grid;gap:2px}
+.ranking-info small{font-size:10px}

@@ -12,6 +12,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
+import random
 import sys
 from typing import Any, Callable
 import zlib
@@ -130,14 +131,83 @@ def builtin_profiles() -> dict[str, SideProfile]:
 
 
 @dataclass(frozen=True)
+class PerturbationOptions:
+    """Seeded jitter applied to a whole series so a run is still reproducible."""
+
+    enabled: bool = True
+    applies_to: tuple[str, ...] = ("official",)
+    speed_pct: float = 3.0
+    accel_pct: float = 3.0
+    time_pct: float = 2.0
+
+    def __post_init__(self) -> None:
+        for name in ("speed_pct", "accel_pct", "time_pct"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or not 0 <= value <= 50:
+                raise ValueError(f"perturbation.{name} must be between 0 and 50")
+        if not isinstance(self.applies_to, (list, tuple)):
+            raise ValueError("perturbation.applies_to must be a list")
+        if set(self.applies_to) - {"official", "manual", "auto_round", "all_play"}:
+            raise ValueError("perturbation.applies_to contains an unknown batch kind")
+
+    def applies(self, kind: str) -> bool:
+        return self.enabled and kind in self.applies_to
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"enabled": self.enabled, "applies_to": list(self.applies_to),
+                "speed_pct": self.speed_pct, "accel_pct": self.accel_pct, "time_pct": self.time_pct}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "PerturbationOptions":
+        data = data or {}
+        if not isinstance(data, dict):
+            raise ValueError("perturbation must be an object")
+        unknown = set(data) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ValueError(f"unknown perturbation option(s): {', '.join(sorted(unknown))}")
+        payload = dict(data)
+        if "applies_to" in payload:
+            payload["applies_to"] = tuple(payload["applies_to"])
+        return cls(**payload)
+
+
+def parameter_groups(parameters: dict[str, Any]) -> dict[str, list[str]]:
+    speeds = [k for k in parameters if k.endswith("_speed_mm_s")]
+    accels = [k for k in parameters if k.endswith("_mm_s2")]
+    times = [k for k in parameters if k.endswith("_ms")]
+    return {"speed": speeds, "accel": accels, "time": times}
+
+
+@dataclass(frozen=True)
 class PlatformConfig:
     default_match: MatchConfig
     scenarios: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: deepcopy(DEFAULT_SCENARIOS))
     frame: FrameOptions = field(default_factory=FrameOptions)
     profiles: dict[str, SideProfile] = field(default_factory=builtin_profiles)
     default_profiles: dict[str, str] = field(default_factory=lambda: {"red": "baseline", "blue": "baseline"})
+    perturbation: PerturbationOptions = field(default_factory=PerturbationOptions)
     schema: int = SCHEMA_VERSION
     path: str = ""
+
+    def perturb(self, parameters: dict[str, Any], key: str) -> tuple[dict[str, Any], dict[str, float]]:
+        """One seeded jitter set for a whole series, so both games share it.
+
+        Symmetric on purpose: the pair swaps sides, and giving one side a slower
+        robot would turn a physics test into an unfair fight.
+        """
+        groups = parameter_groups(parameters)
+        seed = zlib.crc32(key.encode("utf-8"))
+        rng = random.Random(seed)
+        out = dict(parameters)
+        factors: dict[str, float] = {}
+        for group, percent in (("speed", self.perturbation.speed_pct),
+                               ("accel", self.perturbation.accel_pct),
+                               ("time", self.perturbation.time_pct)):
+            factor = 1 + rng.uniform(-percent, percent) / 100
+            factors[group] = round(factor, 5)
+            for name in groups[group]:
+                out[name] = max(1, int(round(out[name] * factor)))
+        return out, factors
 
     def profile(self, name: str | None, team: str) -> SideProfile:
         chosen = name or self.default_profiles.get(team) or ""
@@ -182,6 +252,7 @@ class PlatformConfig:
             "default_match": self.default_match.public_dict(),
             "scenarios": deepcopy(self.scenarios),
             "frame": self.frame.to_dict(),
+            "perturbation": self.perturbation.to_dict(),
             "profiles": [self.profiles[name].public_dict() for name in sorted(self.profiles)],
             "default_profiles": dict(self.default_profiles),
             "path": self.path,
@@ -208,6 +279,7 @@ def platform_dict() -> dict[str, Any]:
         "profiles": dict(config.default_profiles),
         "scenarios": deepcopy(DEFAULT_SCENARIOS),
         "frame": config.frame.to_dict(),
+        "perturbation": config.perturbation.to_dict(),
     }
 
 
@@ -384,6 +456,7 @@ class ConfigStore:
                 default_match=default_match,
                 scenarios=_parse_scenarios(raw.get("scenarios"), default_match),
                 frame=FrameOptions.from_dict(raw.get("frame")),
+                perturbation=PerturbationOptions.from_dict(raw.get("perturbation")),
                 profiles=self._load_profiles(defaults),
                 default_profiles=defaults,
                 schema=schema,
