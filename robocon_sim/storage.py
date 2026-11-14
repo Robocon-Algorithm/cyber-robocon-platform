@@ -12,7 +12,7 @@ from .config import MatchConfig, RATING_TIMING_PROFILE
 from .report import series_summary
 MAX_UPLOAD = 256 * 1024
 INITIAL_ELO = 1000
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS teams(
     id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, active_version TEXT);
@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS series(
     status TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0, lease TEXT,
     config TEXT NOT NULL, matches TEXT NOT NULL, result TEXT, error TEXT,
     created REAL NOT NULL, ranked INTEGER NOT NULL DEFAULT 0,
-    rating_timing_profile TEXT);
+    rating_timing_profile TEXT, red_profile TEXT, blue_profile TEXT);
 CREATE TABLE IF NOT EXISTS occupancy(team_id TEXT PRIMARY KEY, series_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settlements(
     id TEXT PRIMARY KEY, series_id TEXT NOT NULL, pair_index INTEGER NOT NULL,
@@ -158,6 +158,8 @@ class Storage:
         self, a_version: str, b_version: str, count: int = 2,
         config: dict[str, Any] | None = None, *, ranked: bool | None = None,
         matches: list[dict[str, Any]] | None = None,
+        red_profile: str | None = None, blue_profile: str | None = None,
+        rating_profile: str | None = None,
     ) -> str:
         """Freeze one series; every match config is stored so hot reload cannot leak in.
 
@@ -198,10 +200,13 @@ class Storage:
                     raise ValueError('team already has an active series')
                 db.execute('INSERT INTO occupancy VALUES(?,?)', (team, ident))
             db.execute(
-                "INSERT INTO series(id,a,b,a_version,b_version,count,status,config,matches,created,ranked,rating_timing_profile) "
-                "VALUES(?,?,?,?,?,?,'QUEUED',?,?,?,?,?)",
+                "INSERT INTO series(id,a,b,a_version,b_version,count,status,config,matches,created,"
+                "ranked,rating_timing_profile,red_profile,blue_profile) "
+                "VALUES(?,?,?,?,?,?,'QUEUED',?,?,?,?,?,?,?)",
                 (ident, a, b, a_version, b_version, count, json.dumps(matches[0]),
-                 json.dumps(matches), time.time(), ranked, RATING_TIMING_PROFILE if ranked else None),
+                 json.dumps(matches), time.time(), ranked,
+                 (rating_profile or RATING_TIMING_PROFILE) if ranked else None,
+                 red_profile, blue_profile),
             )
         return ident
 

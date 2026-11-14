@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import sys
 from typing import Any, Callable
+import zlib
 
 from .config import MatchConfig
 
@@ -67,18 +68,101 @@ class FrameOptions:
 
 
 @dataclass(frozen=True)
+class SideProfile:
+    """One robot's physical parameter set, loaded from ``<data>/profiles/<name>.json``."""
+
+    name: str
+    label: str
+    parameters: dict[str, Any]
+    notes: str = ""
+    path: str = ""
+
+    @property
+    def digest(self) -> str:
+        canonical = json.dumps(self.parameters, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return f"{zlib.crc32(canonical.encode('utf-8')):08x}"
+
+    def rating_key(self) -> str:
+        """Ratings are only comparable on identical physics, so the digest is part of the key."""
+        return f"{self.name}@{self.digest}"
+
+    def public_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "label": self.label, "digest": self.digest,
+                "notes": self.notes, "parameters": deepcopy(self.parameters)}
+
+
+# Competition-grade numbers: 5 m/s straight line, 3.5 m/s^2 accel/brake
+# (0-5 m/s in 1.4 s over 3.6 m), and mechanism moves as short as a real robot
+# manages when the lift/stairs/turn run in parallel with driving.
+COMPETITION_PARAMETERS: dict[str, int | str] = {
+    "empty_speed_mm_s": 5000, "loaded_speed_mm_s": 5000, "ball_speed_mm_s": 4500,
+    "acceleration_mm_s2": 3500, "braking_mm_s2": 3500,
+    "turn_90_ms": 400,
+    "entry_ms": 4000,
+    "ramp_up_ms": 2000, "ramp_down_ms": 1500,
+    "stairs_up_ms": 2000, "stairs_down_ms": 1500,
+    "l2_up_ms": 1800, "l2_down_ms": 1200,
+    "pick_one_ms": 700, "pick_two_ms": 1200,
+    "stack_pick_ms": 900, "stack_build_ms": 700, "stack_return_ms": 500,
+    "build_base_ms": 600, "build_middle_ms": 800, "build_cap_ms": 800,
+    "flip_cap_ms": 1500,
+    "receive_ball_ms": 900, "place_ball_ms": 900,
+    "put_down_ms": 400, "take_from_ms": 800,
+    "ball_transport_ms": 3000,
+    "parameter_status": "赛级目标值（5 m/s 直线 + 并行机构动作）",
+}
+
+BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
+    "baseline": {"label": "赛级基线", "parameters": dict(COMPETITION_PARAMETERS),
+                 "notes": "5 m/s 直线；转向、上下楼、坡道与取放动作按并行机构压缩。"},
+    "training": {"label": "训练慢速", "parameters": {},
+                 "notes": "config.py 的教学初值（3 m/s），用于对比提速前后的差别。"},
+}
+
+
+def builtin_profiles() -> dict[str, SideProfile]:
+    out = {}
+    for name, spec in BUILTIN_PROFILES.items():
+        merged = MatchConfig(parameters=dict(spec["parameters"])).parameters
+        out[name] = SideProfile(name=name, label=spec["label"], parameters=merged,
+                                notes=spec["notes"])
+    return out
+
+
+@dataclass(frozen=True)
 class PlatformConfig:
     default_match: MatchConfig
     scenarios: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: deepcopy(DEFAULT_SCENARIOS))
     frame: FrameOptions = field(default_factory=FrameOptions)
+    profiles: dict[str, SideProfile] = field(default_factory=builtin_profiles)
+    default_profiles: dict[str, str] = field(default_factory=lambda: {"red": "baseline", "blue": "baseline"})
     schema: int = SCHEMA_VERSION
     path: str = ""
 
-    def matches(self, count: int, overrides: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        """Expand one series into `count` frozen per-match configurations."""
+    def profile(self, name: str | None, team: str) -> SideProfile:
+        chosen = name or self.default_profiles.get(team) or ""
+        found = self.profiles.get(chosen)
+        if found is not None:
+            return found
+        if self.profiles:
+            return self.profiles[sorted(self.profiles)[0]]
+        return builtin_profiles()["baseline"]
+
+    def matches(self, count: int, overrides: dict[str, Any] | None = None, *,
+                red_profile: str | None = None, blue_profile: str | None = None) -> list[dict[str, Any]]:
+        """Expand one series into `count` frozen per-match configurations.
+
+        Each side gets its own parameter set. When both sides resolve to the same
+        profile the match keeps a single shared set, which is what ranked play
+        requires; a perturbation run only spells out the side that differs.
+        """
         if count < 1:
             raise ValueError("count must be positive")
+        red = self.profile(red_profile, "red")
+        blue = self.profile(blue_profile, "blue")
         base = self.default_match.to_dict()
+        base["parameters"] = deepcopy(red.parameters)
+        base["sides"] = {} if red.parameters == blue.parameters else {"blue": deepcopy(blue.parameters)}
         if overrides:
             base.update(deepcopy(overrides))
         base = MatchConfig.from_dict(base).to_dict()
@@ -98,6 +182,8 @@ class PlatformConfig:
             "default_match": self.default_match.public_dict(),
             "scenarios": deepcopy(self.scenarios),
             "frame": self.frame.to_dict(),
+            "profiles": [self.profiles[name].public_dict() for name in sorted(self.profiles)],
+            "default_profiles": dict(self.default_profiles),
             "path": self.path,
         }
 
@@ -119,9 +205,40 @@ def platform_dict() -> dict[str, Any]:
                           "supply_delays_ms": config.default_match.supply_delays_ms,
                           "faults": [],
                           "auto_entry": True},
+        "profiles": dict(config.default_profiles),
         "scenarios": deepcopy(DEFAULT_SCENARIOS),
         "frame": config.frame.to_dict(),
     }
+
+
+def profile_dict(name: str) -> dict[str, Any]:
+    """The document written to a fresh ``profiles/<name>.json``.
+
+    Only the parameters that differ from the built-in teaching defaults are
+    written, so a file doubles as the list of what was changed.
+    """
+    spec = BUILTIN_PROFILES[name]
+    return {"label": spec["label"], "notes": spec["notes"],
+            "parameters": dict(spec["parameters"])}
+
+
+def seed_platform_files(root: str | Path) -> list[Path]:
+    """Write editable defaults for a fresh data directory; never overwrites."""
+    root = Path(root)
+    written = []
+    document = root / 'platform.json'
+    if not document.exists():
+        root.mkdir(parents=True, exist_ok=True)
+        document.write_text(json.dumps(platform_dict(), ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        written.append(document)
+    profile_dir = root / 'profiles'
+    if not any(profile_dir.glob('*.json')):
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        for name in BUILTIN_PROFILES:
+            path = profile_dir / (name + '.json')
+            path.write_text(json.dumps(profile_dict(name), ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+            written.append(path)
+    return written
 
 
 def _parse_scenarios(raw: Any, default_match: MatchConfig) -> dict[str, list[dict[str, Any]]]:
@@ -150,63 +267,134 @@ def _parse_scenarios(raw: Any, default_match: MatchConfig) -> dict[str, list[dic
 
 
 class ConfigStore:
-    """Reads ``platform.json`` and reloads it when the file changes on disk."""
+    """Reads ``platform.json`` plus ``profiles/*.json`` and reloads on change.
+
+    Both the document and the profile directory are watched, so editing one side
+    profile is picked up by the next created series without restarting anything.
+    """
 
     def __init__(self, path: str | Path, *, warn: Callable[[str], None] | None = None) -> None:
         self.path = Path(path)
+        self.profile_dir = self.path.parent / 'profiles'
         self._warn = warn or (lambda message: print(message, file=sys.stderr))
         self._current: PlatformConfig | None = None
-        self._stamp: tuple[int, int] | None = None
+        self._stamp: object = None
         self._warnings: list[dict[str, Any]] = []
 
     @property
     def warnings(self) -> list[dict[str, Any]]:
         return list(self._warnings)
 
-    def _file_stamp(self) -> tuple[int, int] | None:
+    def _stamp_now(self) -> tuple[Any, Any]:
+        """Content hashes of the document and every profile file.
+
+        Timestamps are not enough on their own: two saves inside one filesystem
+        tick produce an identical mtime and size, and the second edit would be
+        silently ignored. The files are a couple of kilobytes, and this runs once
+        per created series, not per frame.
+        """
+        def digest_of(path: Path) -> int | None:
+            try:
+                return zlib.crc32(path.read_bytes())
+            except OSError:
+                return None
+
+        files = []
         try:
-            stat = self.path.stat()
+            for entry in sorted(self.profile_dir.glob('*.json')):
+                files.append((entry.name, digest_of(entry)))
         except OSError:
-            return None
-        return stat.st_mtime_ns, stat.st_size
+            files = []
+        return digest_of(self.path), tuple(files)
 
     def current(self) -> PlatformConfig:
-        stamp = self._file_stamp()
+        stamp = self._stamp_now()
         if self._current is not None and stamp == self._stamp:
             return self._current
         return self.reload(stamp=stamp)
 
-    def reload(self, *, stamp: tuple[int, int] | None = None) -> PlatformConfig:
-        stamp = self._file_stamp() if stamp is None else stamp
-        if stamp is None:
-            if self._current is None:
-                self._current = replace(default_platform(), path=str(self.path))
-            self._stamp = None
-            return self._current
+    def _load_profiles(self, default_profiles: dict[str, str]) -> dict[str, SideProfile]:
+        profiles = builtin_profiles()
+        files = sorted(self.profile_dir.glob('*.json')) if self.profile_dir.is_dir() else []
+        loaded = {}
+        for entry in files:
+            try:
+                raw = json.loads(entry.read_text(encoding="utf-8-sig"))
+                if not isinstance(raw, dict):
+                    raise ValueError("profile must be a JSON object")
+                parameters = raw.get("parameters") or {}
+                if not isinstance(parameters, dict):
+                    raise ValueError("profile parameters must be an object")
+                merged = MatchConfig(parameters=parameters).parameters
+                loaded[entry.stem] = SideProfile(
+                    name=entry.stem,
+                    label=str(raw.get("label") or entry.stem),
+                    parameters=merged,
+                    notes=str(raw.get("notes") or ""),
+                    path=str(entry),
+                )
+            except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+                self._record_warning(entry, exc)
+        if loaded:
+            # Files on disk win; built-ins remain as fallbacks for the other names.
+            profiles.update(loaded)
+        for team, name in default_profiles.items():
+            if name not in profiles:
+                self._record_warning(self.profile_dir, ValueError(
+                    f"default {team} profile '{name}' does not exist; using '{sorted(profiles)[0]}'"))
+                default_profiles[team] = sorted(profiles)[0]
+        return profiles
+
+    def _record_warning(self, path: Path, exc: BaseException) -> None:
+        self._warnings.append({"path": str(path), "error": str(exc)})
+        del self._warnings[:-10]
+        self._warn(f"platform configuration ignored ({path}): {exc}")
+
+    def reload(self, *, stamp: object = None) -> PlatformConfig:
+        stamp = self._stamp_now() if stamp is None else stamp
+        document_stamp, _files = stamp
+        raw: dict[str, Any] = {}
+        if document_stamp is not None:
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
+                if not isinstance(raw, dict):
+                    raise ValueError("platform configuration must be a JSON object")
+            except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+                self._record_warning(self.path, exc)
+                if self._current is not None:
+                    # Keep serving the last good document; a broken edit must not
+                    # silently reset the platform to factory defaults.
+                    self._stamp = stamp
+                    return self._current
+                raw = {}
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
-            if not isinstance(raw, dict):
-                raise ValueError("platform configuration must be a JSON object")
             schema = int(raw.get("schema", SCHEMA_VERSION))
             if schema != SCHEMA_VERSION:
                 raise ValueError(f"unsupported platform schema {schema}")
             default_match = MatchConfig.from_dict(raw.get("default_match") or {})
+            default_profiles = raw.get("profiles") or {}
+            if not isinstance(default_profiles, dict):
+                raise ValueError("profiles must map red/blue to a profile name")
+            unknown = set(default_profiles) - {"red", "blue"}
+            if unknown:
+                raise ValueError(f"unknown profile slot(s): {', '.join(sorted(unknown))}")
+            defaults = {"red": "baseline", "blue": "baseline"}
+            defaults.update({team: str(name) for team, name in default_profiles.items()})
             config = PlatformConfig(
                 default_match=default_match,
                 scenarios=_parse_scenarios(raw.get("scenarios"), default_match),
                 frame=FrameOptions.from_dict(raw.get("frame")),
+                profiles=self._load_profiles(defaults),
+                default_profiles=defaults,
                 schema=schema,
                 path=str(self.path),
             )
         except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
-            message = f"platform configuration ignored ({self.path}): {exc}"
-            self._warnings.append({"path": str(self.path), "error": str(exc)})
-            del self._warnings[:-10]
-            self._warn(message)
-            if self._current is None:
-                self._current = replace(default_platform(), path=str(self.path))
-            self._stamp = stamp
-            return self._current
+            self._record_warning(self.path, exc)
+            if self._current is not None:
+                self._stamp = stamp
+                return self._current
+            config = replace(default_platform(), path=str(self.path))
         self._current = config
         self._stamp = stamp
         return config

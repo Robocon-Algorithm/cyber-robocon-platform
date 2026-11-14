@@ -3,12 +3,81 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from robocon_sim.config import MatchConfig
 from robocon_sim.platform_config import (
     ConfigStore,
     FrameOptions,
     SCHEMA_VERSION,
+    SideProfile,
     platform_dict,
 )
+
+
+class ProfileTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.profiles = self.root / 'profiles'
+        self.profiles.mkdir()
+        self.warnings = []
+        self.path = self.root / 'platform.json'
+        self.store = ConfigStore(self.path, warn=self.warnings.append)
+
+    def write_profile(self, name, parameters, label=None):
+        document = {'parameters': parameters}
+        if label:
+            document['label'] = label
+        (self.profiles / f'{name}.json').write_text(json.dumps(document), encoding='utf-8')
+
+    def test_profiles_come_from_the_directory(self):
+        self.write_profile('fast', {'empty_speed_mm_s': 6000, 'turn_90_ms': 300}, '极速')
+        config = self.store.current()
+        self.assertEqual(sorted(config.profiles), ['baseline', 'fast', 'training'])
+        self.assertEqual(config.profiles['fast'].label, '极速')
+        self.assertEqual(config.profiles['fast'].parameters['empty_speed_mm_s'], 6000)
+        self.assertEqual(config.profiles['fast'].parameters['pick_one_ms'], 1500)
+
+    def test_each_side_gets_its_own_parameters(self):
+        self.write_profile('perturbed', {'empty_speed_mm_s': 4200})
+        matches = self.store.current().matches(2, red_profile='baseline', blue_profile='perturbed')
+        self.assertEqual(matches[0]['parameters']['empty_speed_mm_s'], 5000)
+        self.assertEqual(matches[0]['sides']['blue']['empty_speed_mm_s'], 4200)
+        config = MatchConfig.from_dict(matches[0])
+        self.assertEqual(config.merged_parameters('red')['empty_speed_mm_s'], 5000)
+        self.assertEqual(config.merged_parameters('blue')['empty_speed_mm_s'], 4200)
+        self.assertTrue(config.sides_differ())
+
+    def test_same_profile_keeps_a_single_shared_set(self):
+        matches = self.store.current().matches(2, red_profile='baseline', blue_profile='baseline')
+        self.assertEqual(matches[0]['sides'], {})
+        self.assertFalse(MatchConfig.from_dict(matches[0]).sides_differ())
+
+    def test_missing_default_profile_falls_back_with_a_warning(self):
+        self.path.write_text(json.dumps({**platform_dict(), 'profiles': {'red': 'ghost'}}), encoding='utf-8')
+        config = self.store.current()
+        self.assertIn(config.default_profiles['red'], config.profiles)
+        self.assertTrue(any('ghost' in message for message in self.warnings))
+
+    def test_broken_profile_file_is_ignored(self):
+        (self.profiles / 'bad.json').write_text('{ nope', encoding='utf-8')
+        self.write_profile('ok', {'empty_speed_mm_s': 4400})
+        config = self.store.current()
+        self.assertIn('ok', config.profiles)
+        self.assertNotIn('bad', config.profiles)
+        self.assertTrue(any('bad.json' in warning['path'] for warning in self.store.warnings))
+
+    def test_rating_key_separates_different_physics(self):
+        base = self.store.current().profiles['baseline']
+        other = SideProfile(name='baseline', label='x', parameters={**base.parameters, 'empty_speed_mm_s': 4000})
+        self.assertNotEqual(base.rating_key(), other.rating_key())
+        self.assertTrue(base.rating_key().startswith('baseline@'))
+
+    def test_editing_a_profile_is_picked_up_without_restart(self):
+        self.write_profile('fast', {'empty_speed_mm_s': 6000})
+        self.assertEqual(self.store.current().profiles['fast'].parameters['empty_speed_mm_s'], 6000)
+        self.write_profile('fast', {'empty_speed_mm_s': 6500})
+        self.assertEqual(self.store.current().profiles['fast'].parameters['empty_speed_mm_s'], 6500)
 
 
 class MatchesTests(unittest.TestCase):

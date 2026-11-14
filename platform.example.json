@@ -12,6 +12,10 @@
     "faults": [],
     "auto_entry": true
   },
+  "profiles": {
+    "red": "baseline",
+    "blue": "baseline"
+  },
   "scenarios": {
     "1": [
       {}

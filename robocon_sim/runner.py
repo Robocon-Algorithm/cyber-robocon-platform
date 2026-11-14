@@ -15,11 +15,16 @@ import threading
 import time
 import uuid
 import zlib
+import gzip
 
 from .frame_codec import STATIC_KEYS, FrameWriter
 from .report import MatchMetrics
 MAX_MESSAGE = 2 * 1024 * 1024
 BUNDLE_FORMAT = 'rcf/1'
+COMMAND_LOG = 'commands.jsonl.gz'
+RECEIPT_LOG = 'receipts.jsonl.gz'
+EVENT_LOG = 'events.jsonl'
+DIAGNOSTIC_LOG = 'diagnostics.jsonl'
 BUDGETS = {
     'cpu_ms': 20,
     'wall_ms': 200,
@@ -38,6 +43,12 @@ def digest(value: Any) -> str:
 
 def write_json(path: str | Path, value: Any) -> None:
     Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
+
+def open_log(path: str | Path) -> Any:
+    path = Path(path)
+    if path.suffix == '.gz':
+        return gzip.open(path, 'wt', encoding='utf-8', compresslevel=6)
+    return path.open('w', encoding='utf-8')
 
 def file_hash(path: str | Path) -> str:
     with Path(path).open('rb') as stream:
@@ -261,7 +272,7 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
     write_json(output / 'manifest.json', manifest)
     policies = {}
     diagnostics = []
-    streams = {name: (output / (name + '.jsonl')).open('w', encoding='utf-8') for name in ('commands',)}
+    streams = {name: open_log(output / name) for name in (COMMAND_LOG, RECEIPT_LOG)}
     counts = {name: 0 for name in streams}
     metrics = MatchMetrics()
     frames = FrameWriter(
@@ -272,9 +283,9 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
     )
 
     def append_log(name: str, row: Any) -> None:
-        # No per-line digest any more: commands are small, and tampering is caught
-        # by replaying the match and comparing every frame, which is stronger than
-        # a checksum the writer itself could recompute.
+        # No per-line digest any more: tampering is caught by replaying the match
+        # and comparing every frame, which is stronger than a checksum the writer
+        # itself could recompute.
         streams[name].write(canonical({'log_seq': counts[name], 'payload': row}) + '\n')
         counts[name] += 1
         if counts[name] % 100 == 0:
@@ -292,7 +303,8 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
                 **{key: manifest[key] for key in ('map', 'ruleset_version', 'sdk_version', 'protocol_version')},
             }
             futures = {
-                team: pool.submit(policy.start, {**public_context, 'team': team})
+                team: pool.submit(policy.start, {**public_context, 'team': team,
+                                                 'parameters': config.merged_parameters(team)})
                 for team, policy in policies.items()
             }
             for team, future in futures.items():
@@ -303,7 +315,7 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
             snapshot = initial_state
             checkpoint(snapshot)
             if failures:
-                append_log('commands', {'seq': engine.seq, 'failures': failures, 'decisions': {'red': None, 'blue': None}})
+                append_log(COMMAND_LOG, {'seq': engine.seq, 'failures': failures, 'decisions': {'red': None, 'blue': None}})
                 engine.fail_policies(failures)
                 snapshot = engine.public_state()
                 checkpoint(snapshot)
@@ -322,17 +334,20 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
                             policies[team].errors = 0
                         else:
                             policies[team].errors += 1
+                            diagnostics.append({'team': team, 'phase': 'step', 'seq': engine.seq,
+                                                'sim_time_ms': engine.sim_time_ms,
+                                                'error': response.get('error')})
                             if policies[team].errors >= 3:
                                 failures[team] = 'three consecutive policy errors'
                     except PolicyFailure as exc:
                         failures[team] = str(exc)
-                        responses[team] = {'ok': False, 'error': str(exc), 'hard_failure': True}
+                        diagnostics.append({'team': team, 'phase': 'step', 'seq': engine.seq,
+                                            'sim_time_ms': engine.sim_time_ms, 'error': str(exc)})
                 frame_record = {
                     'seq': engine.seq,
                     'sim_time_ms': engine.sim_time_ms,
                     'decisions': decisions,
                     'failures': failures,
-                    'responses': responses,
                 }
                 if failures:
                     engine.fail_policies(failures)
@@ -340,13 +355,16 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
                 else:
                     snapshot = engine.step(decisions, observations)
                 next_observations = engine.observations(snapshot)
-                frame_record['receipts'] = {
-                    team: next_observations[team]['receipts']
-                    for team in ('red', 'blue')
-                }
+                receipts = {team: next_observations[team]['receipts'] for team in ('red', 'blue')}
                 metrics.interval(observations, engine.sim_time_ms - frame_record['sim_time_ms'])
-                metrics.receipts(frame_record['receipts'])
-                append_log('commands', frame_record)
+                metrics.receipts(receipts)
+                append_log(COMMAND_LOG, frame_record)
+                # Receipts only exist on the frames where a command was judged, and
+                # the replay path derives them from the decisions anyway, so they get
+                # their own sparse log instead of riding along with every frame.
+                if any(receipts.values()):
+                    append_log(RECEIPT_LOG, {'seq': frame_record['seq'],
+                                             'sim_time_ms': frame_record['sim_time_ms'], **receipts})
                 checkpoint(snapshot)
                 observations = next_observations
         final_hash = digest(frame_state(snapshot))
@@ -356,8 +374,8 @@ def run_match(red_path: str | Path, blue_path: str | Path, config: Any=None, out
         result['metrics'] = metrics.finish(engine.events, result['faults'])
         write_json(output / 'result.json', result)
         write_json(output / 'score_ledger.json', result.get('score_ledger', []))
-        for name, rows in [('events', engine.events), ('diagnostics', diagnostics)]:
-            with (output / (name + '.jsonl')).open('w', encoding='utf-8') as stream:
+        for name, rows in ((EVENT_LOG, engine.events), (DIAGNOSTIC_LOG, diagnostics)):
+            with (output / name).open('w', encoding='utf-8') as stream:
                 for index, row in enumerate(rows):
                     stream.write(canonical({'log_seq': index, 'payload': row}) + '\n')
         for stream in streams.values():

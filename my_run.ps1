@@ -2,7 +2,7 @@
 # Run this as a script file; do not paste its lines into the console.
 #
 # Usage:
-#   .\run.ps1                                    # web UI on 127.0.0.1:8765, data dir data/l1-reach
+#   .\run.ps1                                    # web UI on 127.0.0.1:8765, data dir data/arena
 #   .\run.ps1 demo --duration-ms 22000           # short demo match (quick look at opening supply)
 #   .\run.ps1 demo --output runs/demo-first      # full 180s demo match
 #   .\run.ps1 replay runs/demo-first             # verify a replay bundle
@@ -50,7 +50,7 @@ if ($args.Count -gt 0) {
         Write-Host 'Note: appended --trusted-code (local reviewed code only).'
     }
 } else {
-    $forward += @('serve', '--host', '127.0.0.1', '--port', '8765', '--data', 'data/l1-reach', '--trusted-code')
+    $forward += @('serve', '--host', '127.0.0.1', '--port', '8765', '--data', 'data/arena', '--trusted-code')
 }
 
 if ($verArg) { & $exe $verArg @forward } else { & $exe @forward }

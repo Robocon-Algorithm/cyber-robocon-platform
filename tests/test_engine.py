@@ -2,6 +2,7 @@ import unittest
 import math
 from copy import deepcopy
 
+from robocon_sim.config import MatchConfig
 from robocon_sim.engine import Engine
 from robocon_sim.planning import quote_action
 from robocon_sim.rules import RuleError, valid_tower, score_world, validate_operation
@@ -82,10 +83,30 @@ class EngineTests(unittest.TestCase):
             self.assertIs(snap[key], e.world[key])
         obs = e.observations()
         self.assertIs(obs["red"]["map"], obs["blue"]["map"])
-        self.assertIs(obs["red"]["parameters"], e.world["parameters"])
+        # The recorded state keeps both sets; each envelope carries its own flat set.
+        self.assertEqual(set(snap["parameters"]), {"red", "blue"})
+        self.assertIs(obs["red"]["parameters"], e.world["parameters"]["red"])
+        self.assertIs(obs["blue"]["parameters"], e.world["parameters"]["blue"])
+        self.assertNotIn("sides", obs["red"]["parameters"])
         e.step({})
         self.assertIs(e.public_state()["map"], e.world["map"])
         self.assertEqual(e.result()["ruleset_version"], snap["ruleset_version"])
+
+    def test_side_parameters_reach_rules_and_envelopes(self):
+        e = Engine({"auto_entry": False,
+                    "parameters": {"empty_speed_mm_s": 3000},
+                    "sides": {"blue": {"empty_speed_mm_s": 5000, "pick_one_ms": 700}}})
+        red, blue = e._parameters["red"], e._parameters["blue"]
+        self.assertEqual(red["empty_speed_mm_s"], 3000)
+        self.assertEqual(blue["empty_speed_mm_s"], 5000)
+        self.assertEqual(red["pick_one_ms"], 1500)
+        self.assertEqual(blue["pick_one_ms"], 700)
+        self.assertTrue(e.config.sides_differ())
+        obs = e.observations()
+        self.assertEqual(obs["blue"]["parameters"]["empty_speed_mm_s"], 5000)
+        self.assertEqual(obs["red"]["parameters"]["empty_speed_mm_s"], 3000)
+        config = MatchConfig.from_dict(e.config.to_dict())
+        self.assertEqual(config.merged_parameters("blue")["pick_one_ms"], 700)
 
     def test_motion_state_does_not_duplicate_action_segments(self):
         e = self.make()

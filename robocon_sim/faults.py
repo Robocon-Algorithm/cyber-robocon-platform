@@ -120,13 +120,13 @@ class Faults:
         e, r = self.e, self.e.world["robots"][team + "_br"]
         r["control_state"] = "RETRYING" if forced else "PAUSED"
         if forced:
-            return_at = e.sim_time_ms + e.param("retry_return_ms")
-            until = return_at + max(e.param("retry_hold_ms"), e.param("retry_clearance_ms"))
+            return_at = e.sim_time_ms + e.param(team, "retry_return_ms")
+            until = return_at + max(e.param(team, "retry_hold_ms"), e.param(team, "retry_clearance_ms"))
             r.update(recovery_phase="returning", return_at_ms=return_at, recovery_until_ms=until)
             e.schedule(return_at, "br_returned", team=team)
             e.emit("RETRY_STARTED", team=team, return_at_ms=return_at, recovery_until_ms=until)
         else:
-            until = e.sim_time_ms + e.param("box_clearance_ms")
+            until = e.sim_time_ms + e.param(team, "box_clearance_ms")
             r.update(recovery_phase="box_clearance", recovery_until_ms=until)
             e.emit("BOX_CLEARANCE_STARTED", team=team, recovery_until_ms=until)
         if ball:
@@ -140,12 +140,12 @@ class Faults:
         e, s = self.e, self.e.world["supply"][team]
         s["control_state"] = "RETRYING" if forced else "PAUSED"
         if forced:
-            return_at = e.sim_time_ms + e.param("tr_retry_return_ms")
-            until = return_at + max(e.param("retry_hold_ms"), e.param("tr_retry_clearance_ms"))
+            return_at = e.sim_time_ms + e.param(team, "tr_retry_return_ms")
+            until = return_at + max(e.param(team, "retry_hold_ms"), e.param(team, "tr_retry_clearance_ms"))
             s.update(recovery_phase="returning", return_at_ms=return_at, recovery_until_ms=until)
             e.schedule(return_at, "tr_returned", team=team)
         else:
-            until = e.sim_time_ms + e.param("box_clearance_ms")
+            until = e.sim_time_ms + e.param(team, "box_clearance_ms")
             s.update(recovery_phase="box_clearance", recovery_until_ms=until)
         if s["batch"]:
             s["batch"].update(status="recovering", expected_arrival_ms=until + int(e.config.supply_delays_ms[team]))

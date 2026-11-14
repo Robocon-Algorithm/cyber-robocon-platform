@@ -1,6 +1,7 @@
 """Replay only recorded decisions; Python strategy code is never imported."""
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 from typing import Any
@@ -8,36 +9,70 @@ from typing import Any
 from .frame_codec import FrameReader
 from .runner import BUNDLE_FORMAT, digest, file_crc32, file_hash, frame_state
 
+COMMAND_LOGS = ('commands.jsonl.gz', 'commands.jsonl')
+RECEIPT_LOGS = ('receipts.jsonl.gz',)
+EVENT_LOGS = ('events.jsonl',)
+DIAGNOSTIC_LOGS = ('diagnostics.jsonl',)
+TEAMS = ('red', 'blue')
+
 
 def read_log(path: str | Path) -> list[dict[str, Any]]:
-    """Read one JSONL side channel (commands, events, diagnostics)."""
+    """Read one JSONL side channel, plain or gzipped."""
+    path = Path(path)
+    opener = gzip.open if path.suffix == '.gz' else open
     rows = []
-    for index, line in enumerate(Path(path).read_text(encoding='utf-8').splitlines()):
-        if not line:
-            raise ValueError('corrupt log: ' + str(path))
-        row = json.loads(line)
-        if row.get('log_seq') != index:
-            raise ValueError('corrupt log: ' + str(path))
-        rows.append(row['payload'])
+    with opener(path, 'rt', encoding='utf-8') as stream:
+        for index, line in enumerate(stream):
+            if not line.strip():
+                raise ValueError('corrupt log: ' + str(path))
+            row = json.loads(line)
+            if row.get('log_seq') != index:
+                raise ValueError('corrupt log: ' + str(path))
+            rows.append(row['payload'])
     return rows
+
+
+def log_path(root: str | Path, names: tuple[str, ...]) -> Path | None:
+    for name in names:
+        path = Path(root) / name
+        if path.is_file():
+            return path
+    return None
+
+
+def read_named(root: str | Path, names: tuple[str, ...]) -> list[dict[str, Any]]:
+    path = log_path(root, names)
+    return read_log(path) if path else []
 
 
 def event_feed(root: str | Path) -> list[dict[str, Any]]:
     """World events merged with policy receipts and policy errors, time ordered."""
-    root = Path(root)
-    events = list(read_log(root / 'events.jsonl'))
+    events = list(read_named(root, EVENT_LOGS))
     known = {event.get('id') for event in events if 'id' in event}
-    for command in read_log(root / 'commands.jsonl'):
-        for team in ('red', 'blue'):
+
+    def add_receipt(receipt: dict[str, Any], team: str) -> None:
+        if receipt.get('id') in known:
+            return
+        known.add(receipt.get('id'))
+        events.append({**receipt, 'type': 'RECEIPT ' + str(receipt.get('code', '')), 'team': team})
+
+    for row in read_named(root, RECEIPT_LOGS):
+        for team in TEAMS:
+            for receipt in row.get(team) or []:
+                add_receipt(receipt, team)
+    for command in read_named(root, COMMAND_LOGS):
+        # Bundles written before receipts moved to their own log still carry them.
+        for team in TEAMS:
             for receipt in (command.get('receipts') or {}).get(team) or []:
-                if receipt.get('id') in known:
-                    continue
-                known.add(receipt.get('id'))
-                events.append({**receipt, 'type': 'RECEIPT ' + str(receipt.get('code', '')), 'team': team})
+                add_receipt(receipt, team)
             response = (command.get('responses') or {}).get(team)
             if response and not response.get('ok'):
                 events.append({'type': 'POLICY_ERROR', 'occurred_at_ms': command.get('sim_time_ms', 0),
                                'team': team, 'reason': response.get('error')})
+    for row in read_named(root, DIAGNOSTIC_LOGS):
+        if row.get('phase') == 'step' and row.get('error'):
+            events.append({'type': 'POLICY_ERROR', 'occurred_at_ms': row.get('sim_time_ms', 0),
+                           'team': row.get('team'), 'reason': row['error']})
     events.sort(key=lambda event: event.get('occurred_at_ms') or 0)
     return events
 
@@ -65,7 +100,7 @@ def verify_replay(directory: str | Path) -> dict[str, Any]:
             raise ValueError('implementation version mismatch: ' + name)
     reader = FrameReader(root / 'snapshots.rcf')
     reader.verify()
-    commands = read_log(root / 'commands.jsonl')
+    commands = read_named(root, COMMAND_LOGS)
     if reader.frame_count != len(commands) + 1:
         raise ValueError('snapshot count does not match the command count')
     engine = Engine(manifest['config'], map_data=reader.static['map'])
@@ -93,7 +128,7 @@ def verify_replay(directory: str | Path) -> dict[str, Any]:
         raise ValueError('final state mismatch')
     if reader.final_hash != result['final_hash']:
         raise ValueError('frame stream final hash mismatch')
-    if engine.events != read_log(root / 'events.jsonl'):
+    if engine.events != read_named(root, EVENT_LOGS):
         raise ValueError('event mismatch')
     return {'verified': True, 'frames': len(commands), 'final_hash': final_hash,
             'scores': engine.result()['scores']}

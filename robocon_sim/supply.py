@@ -23,10 +23,10 @@ class Supply:
             return
         task = s["ball_task"]
         if task and task["status"] == "queued":
-            task.update(status="in_transit", expected_arrival_ms=e.sim_time_ms + e.param("ball_transport_ms"))
+            task.update(status="in_transit", expected_arrival_ms=e.sim_time_ms + e.param(team, "ball_transport_ms"))
             e.schedule(task["expected_arrival_ms"], "ball_arrival", team=team, task_id=task["id"])
             e.faults.arm(team, "TR", "ball_transport", [task["item_id"]], task["id"],
-                         e.param("ball_transport_ms"), risk_start_ms=e.sim_time_ms)
+                         e.param(team, "ball_transport_ms"), risk_start_ms=e.sim_time_ms)
             e.emit("BALL_DISPATCHED", team=team, task=task.copy())
             return
         if task and task["status"] in ("in_transit", "waiting_handoff", "clearing"):
@@ -128,7 +128,7 @@ class Supply:
         task = s["ball_task"]
         if not task or task["status"] not in ACTIVE_BALL:
             return
-        task.update(status="clearing", clearance_result=status, clearance_until_ms=e.sim_time_ms + e.param("central_clearance_ms"))
+        task.update(status="clearing", clearance_result=status, clearance_until_ms=e.sim_time_ms + e.param(team, "central_clearance_ms"))
         if pause_br:
             e.abort_action(team, "BALL_CLEARANCE", "invalid ball cleared safely")
             e.world["robots"][team + "_br"]["control_state"] = "PAUSED"

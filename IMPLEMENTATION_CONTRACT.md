@@ -16,6 +16,8 @@
 
 `map` 与 `parameters` 在引擎内只读，发布时以**共享引用**进入快照，不逐帧深拷贝；其余字段仍每帧新建。任何就地修改 `world["map"]` / `world["parameters"]` 的行为都会在 `Engine.result()` 被断言拦下。
 
+物理参数按方独立：`MatchConfig.parameters` 是基线，`MatchConfig.sides[team]` 只写与该方不同之处，`merged_parameters(team)` 合并。内核只通过 `Engine.param(team, name)` 取参数，机器人子进程拿到的 `obs["parameters"]` 是**本方**的扁平参数集，因此报价与制动预览用的物理和内核一致。记录用的公共快照里 `parameters` 是 `{red, blue}` 两份，双方各自的道具不进入对方的公开上下文。
+
 机器人编号 `red_br`、`blue_br`，队伍键 `red`、`blue`。坐标单位 mm，角度 mrad，时钟整数 ms。首版字段如下：
 
 - 顶层：`seq, sim_time_ms, world_revision, remaining_ms, self, opponent, robots, towers, items, stacks, supply, qualified, central_ball, score, events, receipts, map, parameters`。
@@ -88,8 +90,10 @@ SDK 导出 `Strategy, Action, Quote, Decision, Observation, StrategyAPI`。`Acti
 
 快照写入 `snapshots.rcf`（`frame_codec.py`，`rcf/1`）：静态块只存一次（`map` 与 `parameters`），逐帧只存与上一帧的差异，每 100 帧一个自包含关键帧（字符串驻留表在关键帧处重置），文件尾是帧索引。编解码必须保持生产者的 dict 键顺序——计分账本按 `towers` 的迭代顺序生成，排序会让重演结果与记录不一致。每条记录带 crc32，只用于发现意外损坏。
 
-`python -m robocon_sim demo` 跑两份基线；`match --red ... --blue ...` 单局；`series` 换边双局和10局场景；`replay` 重演核验；`dump` 打印某帧或帧索引；`serve --host 127.0.0.1 --port 8765 --trusted-code` 本机队内模式。`--config` 指向平台配置文件（`platform_config.py`），文件变更在**创建对战前**生效，已创建的对局在 `series.matches` 冻结。子进程限时不等于安全沙箱：未具备容器／VM 隔离时不开放匿名上传或外网绑定，文档明确真实限制。
+旁路日志按职责拆开：`commands.jsonl.gz` 只保存重演需要的 `seq / sim_time_ms / decisions / failures`；`receipts.jsonl.gz` 只在有回执的帧写入；`events.jsonl` 与 `diagnostics.jsonl` 保持明文便于排查。三者都是 `{log_seq, payload}` 行，读取时校验 `log_seq` 单调。
 
-Web 提供上传策略版本、选择两方、创建对战／换边系列、任务状态、2.5D 地图回放与时间轴、事件和回执、逐件分项、排行榜。回放只读内核快照，不能另写计分。`/api/replay` 只返回元数据与帧时间轴，`/api/replay/frames` 按 50 帧分块提供状态。使用 SQLite 保存队伍、版本、系列占用和唯一结算，双局完整一次事务更新 Elo、重复完成不重复加分，平台失败重跑／整组作废不扣分。schema 由 `PRAGMA user_version=1` 守卫，版本不符直接拒绝加载，不做迁移。
+`python -m robocon_sim demo` 跑两份基线；`match --red ... --blue ...` 单局；`series` 换边双局和10局场景；`replay` 重演核验；`dump` 打印某帧或帧索引；`serve --host 127.0.0.1 --port 8765 --trusted-code` 本机队内模式。`--config` 指向平台配置文件（`platform_config.py`），`profiles/` 目录里每方一档参数，文件变更在**创建对战前**生效，已创建的对局在 `series.matches` 冻结；红蓝档位不同则不得进入排位。子进程限时不等于安全沙箱：未具备容器／VM 隔离时不开放匿名上传或外网绑定，文档明确真实限制。
+
+Web 提供上传策略版本、选择两方、创建对战／换边系列、任务状态、2.5D 地图回放与时间轴、事件和回执、逐件分项、排行榜。回放只读内核快照，不能另写计分。`/api/replay` 只返回元数据与帧时间轴，`/api/replay/frames` 按 50 帧分块提供状态。使用 SQLite 保存队伍、版本、系列占用和唯一结算，双局完整一次事务更新 Elo、重复完成不重复加分，平台失败重跑／整组作废不扣分。schema 由 `PRAGMA user_version=2` 守卫，版本不符直接拒绝加载，不做迁移。
 
 测试至少覆盖运动手算、只读快照、整摞取放、旧报价、接触争用、资格、翻顶、球、供料背压、故障和重试、精确终场、进程超时、命令重演、帧编解码往返与损坏检测、配置热加载与回退、双局一次结算、HTTP上传与回放。具体失败案例优先于照抄实现的测试。实现未覆盖事项须在运行说明列明，不声称已实现或通过。

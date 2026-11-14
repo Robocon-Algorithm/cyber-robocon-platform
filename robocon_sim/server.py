@@ -10,7 +10,7 @@ from urllib.parse import urlparse, parse_qs
 from .storage import Storage, MAX_UPLOAD
 from .runner import run_match, file_hash
 from .frame_codec import FrameReader
-from .platform_config import ConfigStore, SCHEMA_VERSION
+from .platform_config import ConfigStore, SCHEMA_VERSION, seed_platform_files
 from .replay import event_feed
 from .report import series_summary
 WEB_ROOT = Path(__file__).resolve().parent / 'web'
@@ -78,12 +78,22 @@ class Application:
         payload['warnings'] = self.config.warnings
         return payload
 
-    def create_job(self, a_version: str, b_version: str, count: int) -> dict[str, Any]:
+    def create_job(self, a_version: str, b_version: str, count: int,
+                   red_profile: str | None = None, blue_profile: str | None = None) -> dict[str, Any]:
         config = self.config.current()
-        matches = config.matches(count)
+        red = config.profile(red_profile, 'red')
+        blue = config.profile(blue_profile, 'blue')
+        matches = config.matches(count, red_profile=red.name, blue_profile=blue.name)
+        same_physics = red.parameters == blue.parameters
+        # Different physics on each side is a training/perturbation run, never ranked.
+        ranked = count > 1 and same_physics
         ident = self.storage.create_series(
-            a_version, b_version, count, matches=matches, ranked=count > 1)
-        return {'id': ident, 'count': count, 'frame': config.frame.to_dict()}
+            a_version, b_version, count, matches=matches, ranked=ranked,
+            red_profile=red.name, blue_profile=blue.name,
+            rating_profile=red.rating_key() if same_physics else None)
+        return {'id': ident, 'count': count, 'ranked': ranked,
+                'red_profile': red.name, 'blue_profile': blue.name,
+                'frame': config.frame.to_dict()}
 
     def bundle_dir(self, job_id: str, index: int) -> tuple[dict[str, Any], Path]:
         job = self.storage.job(job_id)
@@ -222,7 +232,8 @@ def handler_for(app: Any):
                     team = app.storage.create_team(data['team_name'])
                     result = app.storage.upload(team['id'], data['filename'], data['source'].encode('utf-8'))
                 elif route == '/api/jobs':
-                    result = app.create_job(data['a_version'], data['b_version'], int(data.get('count', 2)))
+                    result = app.create_job(data['a_version'], data['b_version'], int(data.get('count', 2)),
+                                            data.get('red_profile'), data.get('blue_profile'))
                 else:
                     self.respond(404, {'error': 'not found'})
                     return
@@ -246,13 +257,17 @@ def make_server(root: str | Path, host: str='127.0.0.1', port: int=8765, trusted
         app.start()
     return server
 
-def serve(root: str | Path='data/l1-reach', host: str='127.0.0.1', port: int=8765,
+def serve(root: str | Path='data/arena', host: str='127.0.0.1', port: int=8765,
           trusted_code: bool=False, config_path: str | Path | None=None) -> None:
+    seeded = seed_platform_files(Path(config_path).parent if config_path else Path(root))
     server = make_server(root, host, port, trusted_code, config_path=config_path)
     config = server.app.config.current()
     print('RoboCon local: http://%s:%s — reviewed team code only; process isolation is not a security sandbox'
           % (host, server.server_port), flush=True)
     print('platform config: %s' % (config.path or '(built-in defaults)'), flush=True)
+    print('side profiles: %s' % ', '.join(sorted(config.profiles)), flush=True)
+    for path in seeded:
+        print('created default config: %s' % path, flush=True)
     for warning in server.app.config.warnings:
         print('config warning: %s' % warning['error'], flush=True)
     try:

@@ -1,8 +1,8 @@
 ﻿from pathlib import Path
 import tempfile
 import unittest
+from robocon_sim.replay import COMMAND_LOGS,RECEIPT_LOGS,log_path,read_log,verify_replay
 from robocon_sim.runner import run_match
-from robocon_sim.replay import verify_replay,read_log
 
 class MatchRuntimeTests(unittest.TestCase):
     def setUp(self):
@@ -12,7 +12,9 @@ class MatchRuntimeTests(unittest.TestCase):
     def test_accepted_commands_replay_and_tamper_detection(self):
         result=run_match('examples/stack_builder.py','examples/adaptive_raider.py',{'duration_ms':22000},self.root/'match')
         self.assertEqual(result['status'],'completed');self.assertTrue(verify_replay(self.root/'match')['verified'])
-        frames=read_log(self.root/'match'/'commands.jsonl');self.assertTrue(any(f['decisions']['red'] is not None for f in frames))
+        frames=read_log(log_path(self.root/'match',COMMAND_LOGS));self.assertTrue(any(f['decisions']['red'] is not None for f in frames))
+        self.assertFalse(any('receipts' in f for f in frames));self.assertFalse(any('responses' in f for f in frames))
+        self.assertTrue(log_path(self.root/'match',RECEIPT_LOGS).name.endswith('.gz'))
         snapshots=self.root/'match'/'snapshots.rcf'
         self.assertTrue(snapshots.is_file())
         self.assertLess(snapshots.stat().st_size,2*1024*1024)

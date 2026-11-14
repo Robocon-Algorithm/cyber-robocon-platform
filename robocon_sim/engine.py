@@ -44,7 +44,10 @@ class Engine:
         self.events = []
         self.world_revision = 0
         self.world = make_world(map_data or default_map(), self.config.auto_entry)
-        self.world["parameters"] = deepcopy(self.config.parameters)
+        # Physical parameters are per side. With one profile both entries hold the
+        # same dict; a perturbation profile only needs to differ for one side.
+        self._parameters = {team: self.config.merged_parameters(team) for team in TEAMS}
+        self.world["parameters"] = self._parameters
         # Published read-only statics: shared by reference with every snapshot
         # instead of being copied 2-3 times per frame. Guarded by _static_stamp.
         self._statics = {key: self.world[key] for key in _SHARED_KEYS}
@@ -66,8 +69,8 @@ class Engine:
                 self._start_entry(team)
         self._audit()
 
-    def param(self, name: str) -> int:
-        return int(self.config.parameters[name])
+    def param(self, team: str, name: str) -> int:
+        return int(self._parameters[team][name])
 
     def schedule(self, at: int, event_type: str, **data: Any) -> None:
         at = int(at)
@@ -94,7 +97,7 @@ class Engine:
 
     def _start_entry(self, team):
         r = self.world["robots"][team + "_br"]
-        start, target, duration = deepcopy(r["pose"]), point_pose(self.world["map"], team.upper() + "_TRANSFER"), self.param("entry_ms")
+        start, target, duration = deepcopy(r["pose"]), point_pose(self.world["map"], team.upper() + "_TRANSFER"), self.param(team, "entry_ms")
         self._action_serial += 1
         action = {"id": f"action:{self._action_serial}", "kind": "entry", "target": team.upper() + "_TRANSFER",
                   "params": {}, "phase": "traverse", "started_at_ms": 0, "expected_end_ms": duration,
@@ -164,6 +167,9 @@ class Engine:
             obs["robots"] = {robot_id: deepcopy(robot) for robot_id, robot in shared["robots"].items()}
             obs["self"] = obs["robots"][team + "_br"]
             obs["opponent"] = obs["robots"][other + "_br"]
+            # The envelope carries the flat parameter set of this side, so quotes
+            # and braking previews use the same physics the kernel applies.
+            obs["parameters"] = self._parameters[team]
             obs["receipts"] = [dict(r) for r in self._receipts[team][self._receipt_window_start[team]:]]
             result[team] = obs
         return result

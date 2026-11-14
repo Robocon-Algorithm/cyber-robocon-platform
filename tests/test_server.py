@@ -52,6 +52,33 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(len(config['warnings']),1)
         self.assertEqual(config['default_match']['duration_ms'],2000)
 
+    def test_mismatched_side_profiles_are_never_ranked(self):
+        import contextlib,io
+        from robocon_sim.platform_config import platform_dict
+        from robocon_sim.storage import Storage
+        token=json.load(urlopen(self.url+'/api/bootstrap'))['token']
+        source='from brsdk import Strategy\nclass MyStrategy(Strategy):\n def on_step(self,obs,api): return None\n'
+        versions={}
+        for name in ('A','B','C','D'):
+            versions[name]=json.load(self.post('/api/upload',{'team_name':name,'filename':name+'.py','source':source},token))['id']
+        profiles=json.load(urlopen(self.url+'/api/config'))['profiles']
+        self.assertEqual([p['name'] for p in profiles],['baseline','training'])
+        self.assertEqual(profiles[0]['parameters']['empty_speed_mm_s'],5000)
+        mixed=json.load(self.post('/api/jobs',{'a_version':versions['A'],'b_version':versions['B'],'count':2,
+                                              'red_profile':'baseline','blue_profile':'training'},token))
+        self.assertFalse(mixed['ranked'])
+        job=Storage(self.temp.name).job(mixed['id'])
+        self.assertEqual((job['red_profile'],job['blue_profile']),('baseline','training'))
+        self.assertIsNone(job['rating_timing_profile'])
+        self.assertEqual(job['matches'][0]['parameters']['empty_speed_mm_s'],5000)
+        self.assertEqual(job['matches'][0]['sides']['blue']['empty_speed_mm_s'],3000)
+        same=json.load(self.post('/api/jobs',{'a_version':versions['C'],'b_version':versions['D'],'count':2,
+                                             'red_profile':'baseline','blue_profile':'baseline'},token))
+        self.assertTrue(same['ranked'])
+        ranked=Storage(self.temp.name).job(same['id'])
+        self.assertTrue(ranked['rating_timing_profile'].startswith('baseline@'))
+        self.assertEqual(ranked['matches'][0]['sides'],{})
+
     def test_replay_metadata_and_frame_chunks(self):
         import contextlib,io
         from robocon_sim.cli import main as cli

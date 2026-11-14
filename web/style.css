@@ -63,3 +63,5 @@
   transform: rotate(45deg);
 }
 #reach-status { font-weight: bold; }
+
+.profile-pair{display:grid;grid-template-columns:1fr 1fr;gap:10px}

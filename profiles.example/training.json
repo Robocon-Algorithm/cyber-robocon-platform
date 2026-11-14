@@ -1,0 +1,5 @@
+{
+  "label": "训练慢速",
+  "notes": "config.py 的教学初值（3 m/s），用于对比提速前后的差别。",
+  "parameters": {}
+}

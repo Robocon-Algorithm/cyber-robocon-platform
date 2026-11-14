@@ -24,6 +24,7 @@ let currentJob = null;
 let currentIndex = 0;
 let chunkCache = new Map();
 let frameRequest = 0;
+let platformConfig = null;
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -168,8 +169,10 @@ $('job-form').onsubmit = async event => {
       a_version: $('strategy-a').value,
       b_version: $('strategy-b').value,
       count: Number(document.querySelector('[name=count]:checked').value),
+      red_profile: $('red-profile').value || undefined,
+      blue_profile: $('blue-profile').value || undefined,
     });
-    notice('任务已创建，双方策略版本已冻结');
+    notice('任务已创建，双方策略版本与参数已冻结');
     renderCatalog(await api('/api/state'));
   } catch (error) {
     notice(error.message);
@@ -754,13 +757,36 @@ async function boot() {
 async function applyPlatformConfig() {
   try {
     const config = await api('/api/config');
+    platformConfig = config;
     const seconds = Math.round(config.default_match.duration_ms / 1000);
     const tick = config.default_match.tick_ms;
     const headline = $('config-headline');
     if (headline) headline.textContent = seconds + ' 秒 · 两台 BR · 一个时钟';
     if (config.warnings?.length) notice('配置有误，已沿用上一份：' + config.warnings[0].error);
     document.body.dataset.tickMs = String(tick);
+    for (const side of SIDES) {
+      const select = $(side + '-profile');
+      select.replaceChildren();
+      for (const profile of config.profiles || []) {
+        const option = element('option', profile.label + ' · ' + profile.digest.slice(0, 6));
+        option.value = profile.name;
+        option.title = profile.notes || '';
+        select.append(option);
+      }
+      select.value = config.default_profiles?.[side] || select.options[0]?.value || '';
+      select.onchange = renderProfileNote;
+    }
+    renderProfileNote();
   } catch {
     /* the page still works with its own defaults */
   }
+}
+
+function renderProfileNote() {
+  const note = $('profile-note');
+  if (!note) return;
+  const same = $('red-profile').value === $('blue-profile').value;
+  note.textContent = same
+    ? '  双方同参数，双局/十局计榜。'
+    : '  双方参数不同：只会作为训练记录，不计榜。';
 }
