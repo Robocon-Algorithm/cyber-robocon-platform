@@ -1,4 +1,7 @@
 * text=auto eol=lf
+# cmd.exe and some editors need CRLF in these two
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
 *.png binary
 *.jpg binary
 *.zip binary
