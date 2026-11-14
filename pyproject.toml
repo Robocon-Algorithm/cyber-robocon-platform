@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robocon-br-arena"
+version = "0.1.0"
+description = "Local deterministic BR strategy arena"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+robocon-sim = "robocon_sim.cli:main"
+
+[tool.setuptools]
+packages = ["brsdk", "robocon_sim", "robocon_sim.web", "examples"]
+
+[tool.setuptools.package-dir]
+"robocon_sim.web" = "web"
+
+[tool.setuptools.package-data]
+"robocon_sim.web" = ["*.html", "*.css", "*.js"]

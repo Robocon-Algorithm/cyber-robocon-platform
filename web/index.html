@@ -1,0 +1,29 @@
+﻿<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BR / 策略竞技场</title><link rel="stylesheet" href="/style.css"></head>
+<body><header><a class="wordmark" href="/">BR<span>竞技场</span></a><div class="edition">ROBOCON · ALGORITHM LAB<br>女娲补天 / 策略试验台 01</div><span class="local">● 本机队内模式</span></header>
+<main><section class="intro"><div><p class="eyebrow">从同一帧出发，以证据复盘。</p><h1>让策略<br><em>真正交手。</em></h1></div><div class="intro-note"><b>180 秒 · 两台 BR · 一个时钟</b><p>统一动作模型，换边比较快慢供料。每个分数都能翻回物品账本，每次失败都有时间与原因。</p><p class="warning">仅运行已审查的队内 Python。子进程提供故障隔离，不是强安全沙箱。</p></div></section>
+<div class="workspace"><aside><section class="panel"><div class="section-title"><span>01 / 版本库</span><small>UTF-8 · .PY</small></div><form id="upload-form"><label>队伍名称<input id="team-name" placeholder="例如：逐星算法组" maxlength="60" required></label><label class="file-zone">选择策略文件<input id="file" type="file" accept=".py" required><small>继承 Strategy，提供 on_step(obs, api)</small></label><button type="submit">上传并冻结版本 <span>↗</span></button></form><p id="upload-status" class="hint">上传后通过语法与入口检查；安全性由队内审查确认。</p></section>
+<section class="panel"><div class="section-title"><span>02 / 创建对战</span></div><form id="job-form"><label class="red-text">策略 A<select id="strategy-a" required></select></label><label class="blue-text">策略 B<select id="strategy-b" required></select></label><fieldset><legend>评估方式</legend><label><input type="radio" name="count" value="1">单局训练</label><label><input type="radio" name="count" value="2" checked>换边双局</label><label><input type="radio" name="count" value="10">十局场景包</label></fieldset><p class="hint">单局不更新 Elo。完整双局按胜负均值结算一次。十局包含一组故障场景。</p><button type="submit">开始对战 <span>→</span></button></form></section>
+<section class="panel"><div class="section-title"><span>03 / 内部排行榜</span><small>ELO · K=24</small></div><div id="ranking" class="ranking"></div></section></aside>
+<div class="main-column"><section class="arena panel">
+<div class="section-title"><span>04 / 比赛回放</span><small id="replay-label">选择一场已完成对战</small></div>
+<div class="scoreboard">
+  <div class="score-side red-text"><small>RED</small><b id="team-red">红方</b><strong id="score-red">—</strong></div>
+  <div class="clock"><span id="clock">000.0</span><small>模拟时间 / 秒</small></div>
+  <div class="score-side blue-text"><small>BLUE</small><b id="team-blue">蓝方</b><strong id="score-blue">—</strong></div>
+</div>
+<div class="canvas-wrap">
+  <canvas id="arena" width="1000" height="680" role="img" aria-label="规则尺寸 2.5D 比赛地图" aria-describedby="br-summary"></canvas>
+  <div class="map-caption">11 000 × 11 000 mm · L1 +600 / L2 +900 mm<br>作业位为平台几何假设，动画仅展示内核状态</div>
+</div>
+<div id="br-summary" class="br-summary" aria-label="BR 携带状态" hidden>
+  <span id="br-red-status" class="red-text"></span>
+  <span id="br-blue-status" class="blue-text"></span>
+</div>
+<div id="reach-legend" class="reach-legend" hidden>
+  <span class="reach-key"><i aria-hidden="true"></i>L1 跨层放箱点 1–4 对应 L2 公共区；虚线表示正在跨层放箱。</span>
+  <span id="reach-status" hidden></span>
+</div>
+<div class="playback"><button id="play" aria-label="播放暂停">▶</button><input id="timeline" type="range" min="0" max="0" value="0" aria-label="比赛时间轴"><select id="speed" aria-label="播放倍速"><option value="1">1×</option><option value="2">2×</option><option value="4" selected>4×</option><option value="10">10×</option></select></div><div class="replay-meta"><span id="frame-detail">等待回放数据</span><span>画面 / 分数 / 事件均来自裁判内核</span></div></section>
+<section class="panel"><div class="section-title"><span>05 / 任务队列</span><small id="queue-label">串行调度 · 版本已冻结</small></div><div id="jobs" class="jobs"></div></section>
+<div class="inspection"><section class="panel"><div class="section-title"><span>事件与回执</span><small>按比赛时间定位</small></div><div id="events" class="event-list empty">打开回放查看真实事件</div></section><section class="panel"><div class="section-title"><span>逐件分项账本</span><small>内核计分</small></div><div id="ledger" class="ledger empty">选择回放后查看分项</div></section></div></div></div><div id="notice" role="status" aria-live="polite"></div></main><footer>BR ARENA / 教学参数尚未经实车标定 · 整摞建塔正式认可待核规则</footer><script src="/app.js" defer></script></body></html>
